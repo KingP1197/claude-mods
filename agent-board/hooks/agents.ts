@@ -2,9 +2,9 @@
 // validator follows `$` only within one file, so the hooks live in register.tsx.
 // A card appears when an agent spawns. Finished cards stay until the next batch
 // starts, that is, until an agent spawns while none is running.
-import type { AgentInfo, AgentStatus, ModelUsage, ToolSpec } from 'claude-code'
+import type { AgentInfo, AgentStatus, ModelUsage, SessionMessage, ToolSpec } from 'claude-code'
 
-import type { AgentRow, AgentState, AgentTokens, Step, StepStatus } from '../types'
+import type { AgentRow, AgentState, AgentTokens, ChatLine, SentLine, Step, StepStatus } from '../types'
 import type { Hat } from './critter'
 
 export const PANE = 'agent-board'
@@ -265,4 +265,53 @@ export function reconcile(rows: readonly AgentRow[], infos: readonly AgentInfo[]
     const state = stateOf(info.status, r.isTeammate)
     return state === r.state ? r : moveTo(r, state, t)
   })
+}
+
+/** How many of an agent's messages its opened card shows. */
+const SHOWN_LINES = 3
+/** A longer message is cut to this many characters, so one message cannot fill the board. */
+const LINE_CHARS = 280
+
+const clip = (s: string) => (s.length > LINE_CHARS ? `${s.slice(0, LINE_CHARS - 1).trimEnd()}…` : s)
+
+/** `mcp__agent-board__report_progress` reads `report_progress`; a built-in tool keeps its name. */
+const toolName = (t: string) => (t.startsWith('mcp__') ? t.slice(t.lastIndexOf('__') + 2) : t)
+
+/** One message as a line, or null for one with nothing to read (a tool's answer back to the agent). */
+function lineOf(m: SessionMessage): ChatLine | null {
+  // The board's own nudge rides on every brief; the user did not write it.
+  const text = m.text.replace(NUDGE, '').trim()
+  if (m.role === 'user') return text === '' ? null : { who: 'to-agent', text: clip(text) }
+  if (text !== '') return { who: 'agent', text: clip(text) }
+  const tools = [...new Set(m.toolUses.map((u) => toolName(u.tool)))]
+  return tools.length === 0 ? null : { who: 'agent', text: `Used ${tools.join(', ')}` }
+}
+
+const sentLine = (s: SentLine): ChatLine => ({ who: 'to-agent', text: clip(s.text) })
+
+/** An agent's last few messages with something to read, oldest first, the user's own sent ones each in its
+ *  place. One recorded past the end of what was read back still shows, last. */
+export function recentLines(messages: readonly SessionMessage[], mine: readonly SentLine[] = []): ChatLine[] {
+  const sentAfter = (n: number) => mine.filter((s) => s.after === n).map(sentLine)
+  const lines = [
+    ...sentAfter(0),
+    ...messages.flatMap((m, i) => [lineOf(m), ...sentAfter(i + 1)]),
+    ...mine.filter((s) => s.after > messages.length).map(sentLine),
+  ]
+  return lines.filter((l) => l !== null).slice(-SHOWN_LINES)
+}
+
+/** A finished agent woken by a message runs again; a live one is unchanged. */
+export const resumed = (r: AgentRow): AgentRow => (isLive(r) ? r : { ...r, state: 'running', endedAt: null })
+
+/** Shown after a send that a permission check refused, such as auto mode's. */
+export const PERMISSION_HINT = 'Switch modes, or add SendMessage to your allow list.'
+
+/** The engine gives no way to read the permission mode, so the refusal's own words say whether a check refused it. */
+const isPermissionRefusal = (reason: string) => /auto.?mode|classifier|permission/i.test(reason)
+
+/** The note under the box after a send was refused: only what to do when a permission check refused it
+ *  (its own reason is written for Claude, not the user), else the reason. */
+export function notSentNote(reason: string): string {
+  return isPermissionRefusal(reason) ? PERMISSION_HINT : `Not sent: ${reason.trim().replace(/\.+$/, '')}.`
 }

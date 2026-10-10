@@ -3,7 +3,8 @@
 // Top: three cards with the batch's agent count, tokens used in all, and time from first start to last end.
 // Then Running and Finished sections. Each card: a pixel critter whose hat shows the effort tier, the task's
 // name, tier, model and effort, the agent's to-do progress when it keeps a list, its context share, tokens and
-// time, and a bar. A click on the name shows the brief and the token detail.
+// time, and a bar. A click on the name shows the brief, the token detail, the agent's last three messages,
+// a box to message it, and a Stop button while it runs.
 // Every hook lives in this file: the validator follows `$` only within one file.
 import { atom, read, update } from 'claude-code'
 import type {
@@ -16,7 +17,7 @@ import type {
   RenderSurface,
 } from 'claude-code'
 
-import type { AgentRow, Step } from '../types'
+import type { AgentRow, Chat, SentLine, Step } from '../types'
 import {
   COMMAND,
   MARK,
@@ -38,8 +39,11 @@ import {
   observed,
   ok,
   prettyModel,
+  notSentNote,
   progress,
+  recentLines,
   reconcile,
+  resumed,
   settle,
   short,
   startBatch,
@@ -62,6 +66,8 @@ const now = atom({ plugin: 'agent-board', key: 'now' } as const, 0)
 const effort = atom({ plugin: 'agent-board', key: 'effort' } as const, null)
 const contextWindow = atom({ plugin: 'agent-board', key: 'window' } as const, null as number | null)
 const isFinishedShown = atom({ plugin: 'agent-board', key: 'isFinishedShown' } as const, true)
+const chat = atom({ plugin: 'agent-board', key: 'chat' } as const, null as Chat | null)
+const sentLog = atom({ plugin: 'agent-board', key: 'sent' } as const, {} as Record<string, SentLine[]>)
 
 // The one clock the cards count from. It only moves forward.
 const advance = ($: EngineInterface, t: number) => update($, now, (n) => Math.max(n, t))
@@ -75,6 +81,78 @@ async function tick($: EngineInterface) {
   const infos = await $.agent.list().catch(() => null)
   if (infos !== null) await update($, agents, (list) => reconcile(list, infos, t))
   await advance($, t)
+  const shown = await read($, openAgent)
+  const agentId = rows.find((r) => r.id === shown)?.agentId ?? null
+  if (agentId !== null) await loadChat($, agentId)
+}
+
+/** Reads the open card's agent's last messages into the chat view, if that card is still the open one. */
+async function loadChat($: EngineInterface, agentId: string) {
+  const [found, sent] = await Promise.all([$.session.messages({ agentId }).catch(() => null), read($, sentLog)])
+  const mine = sent[agentId] ?? []
+  const lines = Array.isArray(found) ? recentLines(found, mine) : mine.length === 0 ? null : recentLines([], mine)
+  await update($, chat, (c) => (c?.agentId === agentId ? { ...c, lines } : c))
+}
+
+/** Opens a card, or closes it when it is the open one. Opening reads its agent's last messages. */
+async function toggleCard($: EngineInterface, r: AgentRow) {
+  let isOpening = false
+  await update($, openAgent, (cur) => {
+    isOpening = cur !== r.id
+    return isOpening ? r.id : null
+  })
+  const fresh: Chat | null =
+    isOpening && r.agentId !== null ? { agentId: r.agentId, lines: [], note: null, sent: 0 } : null
+  await update($, chat, () => fresh)
+  if (fresh !== null) await loadChat($, fresh.agentId)
+}
+
+const noteChat = ($: EngineInterface, agentId: string, note: string, isSent = false) =>
+  update($, chat, (c) => (c?.agentId === agentId ? { ...c, note, sent: c.sent + (isSent ? 1 : 0) } : c))
+
+/** Sends the user's message to the agent. A running agent gets it as a plain user message in its conversation,
+ *  as the built-in agent window's messages read; a finished one (or a refused append) gets it delivered, which
+ *  wakes it, so its card runs again. */
+async function sendTo($: EngineInterface, r: AgentRow, typed: string) {
+  const text = typed.trim()
+  if (r.agentId === null || text === '') return
+  const agentId = r.agentId
+  // Where it goes among the agent's messages, counted before it is sent.
+  const before = await $.session.messages({ agentId }).catch(() => null)
+  const log = { text, after: Array.isArray(before) ? before.length : 0 }
+  const remember = () => update($, sentLog, (all) => ({ ...all, [agentId]: [...(all[agentId] ?? []), log] }))
+  if (isLive(r)) {
+    const added = await $.session
+      .append({ agentId, message: { type: 'user', content: [{ type: 'text', text }] } })
+      .catch((err: unknown) => ({ deny: String(err) }))
+    if (added.deny === undefined) {
+      await remember()
+      await noteChat($, agentId, 'Added to its conversation. It reads it at its next step.', true)
+      return loadChat($, agentId)
+    }
+  }
+  const sent = await $.session.send({ to: { agentId }, text }).catch((err: unknown) => ({
+    isDelivered: false as const,
+    reason: String(err),
+  }))
+  if (!sent.isDelivered) return noteChat($, agentId, notSentNote(sent.reason))
+  await remember()
+  await noteChat($, agentId, 'Sent. It reads it at its next step.', true)
+  await changeAgent($, agentId, resumed)
+  await loadChat($, agentId)
+}
+
+/** Stops the agent through Claude's own stop tool. The call goes through the user's permission settings as is. */
+async function stopAgent($: EngineInterface, r: AgentRow) {
+  if (r.agentId === null) return
+  const agentId = r.agentId
+  await noteChat($, agentId, 'Stopping…')
+  const out = await $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch((err: unknown) => ({ deny: String(err) }))
+  if ('deny' in out && out.deny !== undefined) return noteChat($, agentId, `Not stopped: ${out.deny}`)
+  if ('isError' in out && out.isError === true) return noteChat($, agentId, `Not stopped: ${out.text}`)
+  const t = await $.clock.now()
+  await changeAgent($, agentId, (x) => moveTo(x, 'stopped', t))
+  await noteChat($, agentId, 'Stopped.')
 }
 
 /** Changes the row of one agent; false when no row carries that agentId yet. */
@@ -188,6 +266,7 @@ function createdId(result: unknown): string | null {
 type Board = {
   rows: readonly AgentRow[]
   shown: string | null
+  chat: Chat | null
   t: number
   window: number | null
   isFinishedShown: boolean
@@ -278,6 +357,88 @@ function details(els: ElementTable, r: AgentRow) {
   )
 }
 
+// What the opened card has read of the agent's conversation.
+function chatLines(els: ElementTable, c: Chat | null) {
+  const { Box, Text } = els
+  if (c === null) return null
+  if (c.lines === null)
+    return (
+      <Text key="unread" color="subtle" wrap="wrap">
+        Its messages can't be read here.
+      </Text>
+    )
+  if (c.lines.length === 0)
+    return (
+      <Text key="unread" color="subtle">
+        No messages yet.
+      </Text>
+    )
+  return (
+    <Box key="lines" flexDirection="column">
+      {c.lines.map((l, i) => (
+        <Box key={`line${i}`} flexDirection="column">
+          <Text key="who" color={l.who === 'agent' ? 'success' : 'subtle'} bold>
+            {l.who === 'agent' ? 'Agent' : 'To the agent'}
+          </Text>
+          <Text key="said" wrap="wrap">
+            {l.text}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+// The box to message the agent. The phone app draws no text field, so there it says where to type instead.
+function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, c: Chat | null) {
+  if (!('Input' in els) || els.Input === undefined)
+    return (
+      <els.Text key="say-elsewhere" color="subtle" wrap="wrap">
+        Message it from the desktop app or the terminal.
+      </els.Text>
+    )
+  // A fresh key after each send draws an empty box.
+  return (
+    <els.Input
+      key={`say:${r.id}:${c?.sent ?? 0}`}
+      placeholder={isLive(r) ? 'Message this agent' : 'Message it to pick up again'}
+      submitLabel="send"
+      onSubmit={(text: string) => void sendTo($, r, text)}
+    />
+  )
+}
+
+// Under an opened card's brief: its last messages, a box to message it, and Stop while it runs.
+function talk($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
+  const { Box, Text, Button } = els
+  if (r.agentId === null)
+    return (
+      <Text key="talk" color="subtle">
+        Starting. Its messages show here once it runs.
+      </Text>
+    )
+  const c = b.chat?.agentId === r.agentId ? b.chat : null
+  return (
+    <Box key="talk" flexDirection="column" marginTop={1} gap={1}>
+      <Text key="talk-head" color="subtle">
+        Last messages
+      </Text>
+      {chatLines(els, c)}
+      <Box key="say-row" flexDirection="row" gap={1}>
+        <Box key="say-box" flexGrow={1} flexShrink={1}>
+          {sayBox($, els, r, c)}
+        </Box>
+        {isLive(r) ? <Button key={`stop:${r.id}`} label="Stop" onPress={() => stopAgent($, r)} /> : null}
+      </Box>
+      {c === null || c.note === null ? null : (
+        <Text key="note" color="subtle" wrap="wrap">
+          {c.note}
+        </Text>
+      )}
+    </Box>
+  )
+}
+
 function agentCard($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
   const { Box, Text, Button } = els
   const tier = tierOf(r.effort)
@@ -288,12 +449,7 @@ function agentCard($: EngineInterface, els: ElementTable, b: Board, r: AgentRow)
       {critter(els, b, r, tier)}
       <Box key="body" flexDirection="column" flexGrow={1} flexShrink={1}>
         <Box key="top" flexDirection="row" justifyContent="space-between">
-          <Button
-            key={`name:${r.id}`}
-            plain
-            label={r.description}
-            onPress={() => update($, openAgent, (cur) => (cur === r.id ? null : r.id))}
-          />
+          <Button key={`name:${r.id}`} plain label={r.description} onPress={() => toggleCard($, r)} />
           <Text key="mark" color={mark.color} bold>
             {mark.glyph}
           </Text>
@@ -321,6 +477,7 @@ function agentCard($: EngineInterface, els: ElementTable, b: Board, r: AgentRow)
         </Box>
         {bar(els, b, r, tier.color)}
         {b.shown === r.id ? details(els, r) : null}
+        {b.shown === r.id ? talk($, els, b, r) : null}
       </Box>
     </Box>
   )
@@ -346,6 +503,7 @@ function finishedSection($: EngineInterface, els: ElementTable, b: Board) {
       <Button
         key="toggle-finished"
         plain
+        dimColor
         label={`${b.isFinishedShown ? '▾' : '▸'} Finished · ${ended.length}`}
         onPress={() => update($, isFinishedShown, (v) => !v)}
       />
@@ -422,6 +580,8 @@ function agentHooks(on: On, notes: Notes) {
     })
     if (isNewBatch) {
       await update($, openAgent, () => null)
+      await update($, chat, () => null)
+      await update($, sentLog, () => ({}))
       void openBoard($)
     }
     await advance($, t)
@@ -489,9 +649,10 @@ function paneHooks(on: On) {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text } = els
-    const [rows, shown, t, window, finishedShown] = await Promise.all([
+    const [rows, shown, talking, t, window, finishedShown] = await Promise.all([
       read($, agents),
       read($, openAgent),
+      read($, chat),
       read($, now),
       read($, contextWindow),
       read($, isFinishedShown),
@@ -508,6 +669,7 @@ function paneHooks(on: On) {
     const b: Board = {
       rows,
       shown,
+      chat: talking,
       t,
       window,
       isFinishedShown: finishedShown,

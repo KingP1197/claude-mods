@@ -51,6 +51,32 @@ export type AgentRow = {
   steps?: Step[]
 }
 
+/** One message of an agent's conversation, as its opened card shows it. */
+export type ChatLine = {
+  /** `agent`: what the agent wrote or did. `to-agent`: its brief, or a message sent to it. */
+  who: 'agent' | 'to-agent'
+  text: string
+}
+
+/** A message the user sent from a card. The engine hides a mod's messages when a conversation is read back,
+ *  so the board keeps its own copy, and where it went. */
+export type SentLine = {
+  text: string
+  /** How many of the agent's messages came before it, so it shows in its place among them. */
+  after: number
+}
+
+/** The opened card's view of its agent's conversation, and what the user did there. */
+export type Chat = {
+  agentId: string
+  /** Its last few messages, oldest first; null when the engine cannot read its conversation. */
+  lines: ChatLine[] | null
+  /** The outcome of the last message sent or stop asked, shown under the box. */
+  note: string | null
+  /** How many messages were sent from this card; each send draws a fresh, empty box. */
+  sent: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'agent-board': {
@@ -65,6 +91,10 @@ declare module 'claude-code' {
       window: number | null
       /** Whether the Finished section shows its cards. */
       isFinishedShown: boolean
+      /** The opened card's conversation view; null while no card is open. */
+      chat: Chat | null
+      /** Each agent's messages from the user, by agentId; cleared when a new batch starts. */
+      sent: Record<string, SentLine[]>
     }
   }
 }
