@@ -1,0 +1,8 @@
+{
+  "name": "kp-mods",
+  "owner": { "name": "Leander" },
+  "plugins": [
+    { "name": "desk-status", "source": "./desk-status" },
+    { "name": "agent-board", "source": "./agent-board" }
+  ]
+}
