@@ -26,6 +26,7 @@ The install command works only in a terminal. A mod installed there at the user 
 - Only one mod can draw above the prompt. If another installed mod also does, the two will clash.
 - A message to a running agent goes straight into its conversation, without a permission check. The agent reads it as a plain user message.
 - A message to a finished agent wakes it up through Claude Code's SendMessage tool. Auto mode may block that, and the card then says so. To send anyway, switch modes, or add `SendMessage` to the `permissions.allow` list in your settings. That rule lets every SendMessage through, including ones Claude sends on its own.
+- Stop uses Claude Code's TaskStop tool. If auto mode or a permission rule blocks it, the card says to switch modes or add `TaskStop` to your allow list.
 - Tested with Claude Code 2.1.296. Older versions may not support mods.
 
 ## Remove

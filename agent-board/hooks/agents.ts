@@ -277,11 +277,14 @@ const clip = (s: string) => (s.length > LINE_CHARS ? `${s.slice(0, LINE_CHARS - 
 /** `mcp__agent-board__report_progress` reads `report_progress`; a built-in tool keeps its name. */
 const toolName = (t: string) => (t.startsWith('mcp__') ? t.slice(t.lastIndexOf('__') + 2) : t)
 
-/** One message as a line, or null for one with nothing to read (a tool's answer back to the agent). */
+/** Claude Code's marker in a stopped agent's conversation. It reads as a user message, but nobody wrote it. */
+const isStopMarker = (text: string) => /^\[Request interrupted by user[^\]]*\]$/.test(text)
+
+/** One message as a line, or null for one with nothing to read (a tool's answer back to the agent, or a stop). */
 function lineOf(m: SessionMessage): ChatLine | null {
   // The board's own nudge rides on every brief; the user did not write it.
   const text = m.text.replace(NUDGE, '').trim()
-  if (m.role === 'user') return text === '' ? null : { who: 'to-agent', text: clip(text) }
+  if (m.role === 'user') return text === '' || isStopMarker(text) ? null : { who: 'to-agent', text: clip(text) }
   if (text !== '') return { who: 'agent', text: clip(text) }
   const tools = [...new Set(m.toolUses.map((u) => toolName(u.tool)))]
   return tools.length === 0 ? null : { who: 'agent', text: `Used ${tools.join(', ')}` }
@@ -290,13 +293,17 @@ function lineOf(m: SessionMessage): ChatLine | null {
 const sentLine = (s: SentLine): ChatLine => ({ who: 'to-agent', text: clip(s.text) })
 
 /** An agent's last few messages with something to read, oldest first, the user's own sent ones each in its
- *  place. One recorded past the end of what was read back still shows, last. */
-export function recentLines(messages: readonly SessionMessage[], mine: readonly SentLine[] = []): ChatLine[] {
-  const sentAfter = (n: number) => mine.filter((s) => s.after === n).map(sentLine)
+ *  place. One recorded past the end of what was read back still shows, last. A delivered message can show in
+ *  the conversation read back while it waits for the agent; then the board's own copy is left out. */
+export function recentLines(messages: readonly SessionMessage[], sentHere: readonly SentLine[]): ChatLine[] {
+  const isReadBack = (s: SentLine) =>
+    messages.some((m, i) => i >= s.after && m.role === 'user' && m.text.includes(s.text))
+  const shown = sentHere.filter((s) => !isReadBack(s))
+  const sentAfter = (n: number) => shown.filter((s) => s.after === n).map(sentLine)
   const lines = [
     ...sentAfter(0),
     ...messages.flatMap((m, i) => [lineOf(m), ...sentAfter(i + 1)]),
-    ...mine.filter((s) => s.after > messages.length).map(sentLine),
+    ...shown.filter((s) => s.after > messages.length).map(sentLine),
   ]
   return lines.filter((l) => l !== null).slice(-SHOWN_LINES)
 }
@@ -304,14 +311,19 @@ export function recentLines(messages: readonly SessionMessage[], mine: readonly 
 /** A finished agent woken by a message runs again; a live one is unchanged. */
 export const resumed = (r: AgentRow): AgentRow => (isLive(r) ? r : { ...r, state: 'running', endedAt: null })
 
-/** Shown after a send that a permission check refused, such as auto mode's. */
-export const PERMISSION_HINT = 'Switch modes, or add SendMessage to your allow list.'
+/** What the user can do after a permission check, such as auto mode's, refused the board's call to a tool. */
+export const permissionHint = (tool: CardTool) => `Switch modes, or add ${tool} to your allow list.`
 
-/** The engine gives no way to read the permission mode, so the refusal's own words say whether a check refused it. */
-const isPermissionRefusal = (reason: string) => /auto.?mode|classifier|permission/i.test(reason)
+/** The engine gives no way to read the permission mode, so the refusal's own words say whether a check refused
+ *  it. "denied" and "needs approval" are how a permission rule's refusals read. */
+const isPermissionRefusal = (reason: string) => /auto.?mode|classifier|permission|denied|approval/i.test(reason)
 
-/** The note under the box after a send was refused: only what to do when a permission check refused it
- *  (its own reason is written for Claude, not the user), else the reason. */
-export function notSentNote(reason: string): string {
-  return isPermissionRefusal(reason) ? PERMISSION_HINT : `Not sent: ${reason.trim().replace(/\.+$/, '')}.`
+/** The tools a card's buttons use, and what a refusal of each says first. */
+const REFUSED = { SendMessage: 'Not sent', TaskStop: 'Not stopped' } as const
+type CardTool = keyof typeof REFUSED
+
+/** The note under the box after a card's send or stop was refused: only what to do when a permission check
+ *  refused it (its own reason is written for Claude, not the user), else the reason. */
+export function refusalNote(tool: CardTool, reason: string): string {
+  return isPermissionRefusal(reason) ? permissionHint(tool) : `${REFUSED[tool]}: ${reason.trim().replace(/\.+$/, '')}.`
 }

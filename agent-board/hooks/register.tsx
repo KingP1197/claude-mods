@@ -39,7 +39,7 @@ import {
   observed,
   ok,
   prettyModel,
-  notSentNote,
+  refusalNote,
   progress,
   recentLines,
   reconcile,
@@ -72,15 +72,17 @@ const sentLog = atom({ plugin: 'agent-board', key: 'sent' } as const, {} as Reco
 // The one clock the cards count from. It only moves forward.
 const advance = ($: EngineInterface, t: number) => update($, now, (n) => Math.max(n, t))
 
-// Each second: while any agent runs, move the clock and fold in the engine's agent list.
+// Each second: while any agent runs, move the clock and fold in the engine's agent list. The open card reads
+// its agent's messages every second either way, as one opened in the app's own window can still be talked to.
 async function tick($: EngineInterface) {
   const rows = await read($, agents)
-  if (!rows.some(isLive)) return
-  const t = await $.clock.now()
-  // No list this second: the rows keep their state and the clock still moves.
-  const infos = await $.agent.list().catch(() => null)
-  if (infos !== null) await update($, agents, (list) => reconcile(list, infos, t))
-  await advance($, t)
+  if (rows.some(isLive)) {
+    const t = await $.clock.now()
+    // No list this second: the rows keep their state and the clock still moves.
+    const infos = await $.agent.list().catch(() => null)
+    if (infos !== null) await update($, agents, (list) => reconcile(list, infos, t))
+    await advance($, t)
+  }
   const shown = await read($, openAgent)
   const agentId = rows.find((r) => r.id === shown)?.agentId ?? null
   if (agentId !== null) await loadChat($, agentId)
@@ -88,9 +90,11 @@ async function tick($: EngineInterface) {
 
 /** Reads the open card's agent's last messages into the chat view, if that card is still the open one. */
 async function loadChat($: EngineInterface, agentId: string) {
-  const [found, sent] = await Promise.all([$.session.messages({ agentId }).catch(() => null), read($, sentLog)])
-  const mine = sent[agentId] ?? []
-  const lines = Array.isArray(found) ? recentLines(found, mine) : mine.length === 0 ? null : recentLines([], mine)
+  const [found, allSent] = await Promise.all([$.session.messages({ agentId }).catch(() => null), read($, sentLog)])
+  const sentHere = allSent[agentId] ?? []
+  const isUnread = !Array.isArray(found)
+  // Unread and nothing sent from here: nothing to show. Unread with sends: just the user's own lines.
+  const lines = isUnread && sentHere.length === 0 ? null : recentLines(isUnread ? [] : found, sentHere)
   await update($, chat, (c) => (c?.agentId === agentId ? { ...c, lines } : c))
 }
 
@@ -110,32 +114,34 @@ async function toggleCard($: EngineInterface, r: AgentRow) {
 const noteChat = ($: EngineInterface, agentId: string, note: string, isSent = false) =>
   update($, chat, (c) => (c?.agentId === agentId ? { ...c, note, sent: c.sent + (isSent ? 1 : 0) } : c))
 
+/** A call that threw reads as a refusal with the error as its reason. */
+const thrownAsDeny = (err: unknown) => ({ deny: String(err) })
+
 /** Sends the user's message to the agent. A running agent gets it as a plain user message in its conversation,
  *  as the built-in agent window's messages read; a finished one (or a refused append) gets it delivered, which
  *  wakes it, so its card runs again. */
-async function sendTo($: EngineInterface, r: AgentRow, typed: string) {
+async function sendTo($: EngineInterface, agentId: string, isRunning: boolean, typed: string) {
   const text = typed.trim()
-  if (r.agentId === null || text === '') return
-  const agentId = r.agentId
+  if (text === '') return
   // Where it goes among the agent's messages, counted before it is sent.
   const before = await $.session.messages({ agentId }).catch(() => null)
-  const log = { text, after: Array.isArray(before) ? before.length : 0 }
-  const remember = () => update($, sentLog, (all) => ({ ...all, [agentId]: [...(all[agentId] ?? []), log] }))
-  if (isLive(r)) {
+  const line: SentLine = { text, after: Array.isArray(before) ? before.length : 0 }
+  const remember = () => update($, sentLog, (all) => ({ ...all, [agentId]: [...(all[agentId] ?? []), line] }))
+  if (isRunning) {
     const added = await $.session
       .append({ agentId, message: { type: 'user', content: [{ type: 'text', text }] } })
-      .catch((err: unknown) => ({ deny: String(err) }))
+      .catch(thrownAsDeny)
     if (added.deny === undefined) {
       await remember()
       await noteChat($, agentId, 'Added to its conversation. It reads it at its next step.', true)
       return loadChat($, agentId)
     }
   }
-  const sent = await $.session.send({ to: { agentId }, text }).catch((err: unknown) => ({
+  const delivery = await $.session.send({ to: { agentId }, text }).catch((err: unknown) => ({
     isDelivered: false as const,
     reason: String(err),
   }))
-  if (!sent.isDelivered) return noteChat($, agentId, notSentNote(sent.reason))
+  if (!delivery.isDelivered) return noteChat($, agentId, refusalNote('SendMessage', delivery.reason))
   await remember()
   await noteChat($, agentId, 'Sent. It reads it at its next step.', true)
   await changeAgent($, agentId, resumed)
@@ -143,13 +149,11 @@ async function sendTo($: EngineInterface, r: AgentRow, typed: string) {
 }
 
 /** Stops the agent through Claude's own stop tool. The call goes through the user's permission settings as is. */
-async function stopAgent($: EngineInterface, r: AgentRow) {
-  if (r.agentId === null) return
-  const agentId = r.agentId
+async function stopAgent($: EngineInterface, agentId: string) {
   await noteChat($, agentId, 'Stopping…')
-  const out = await $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch((err: unknown) => ({ deny: String(err) }))
-  if ('deny' in out && out.deny !== undefined) return noteChat($, agentId, `Not stopped: ${out.deny}`)
-  if ('isError' in out && out.isError === true) return noteChat($, agentId, `Not stopped: ${out.text}`)
+  const out = await $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(thrownAsDeny)
+  const refused = 'deny' in out ? out.deny : out.isError === true ? out.text : undefined
+  if (refused !== undefined) return noteChat($, agentId, refusalNote('TaskStop', refused))
   const t = await $.clock.now()
   await changeAgent($, agentId, (x) => moveTo(x, 'stopped', t))
   await noteChat($, agentId, 'Stopped.')
@@ -390,7 +394,7 @@ function chatLines(els: ElementTable, c: Chat | null) {
 }
 
 // The box to message the agent. The phone app draws no text field, so there it says where to type instead.
-function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, c: Chat | null) {
+function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, agentId: string, c: Chat | null) {
   if (!('Input' in els) || els.Input === undefined)
     return (
       <els.Text key="say-elsewhere" color="subtle" wrap="wrap">
@@ -403,7 +407,7 @@ function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, c: Chat | nu
       key={`say:${r.id}:${c?.sent ?? 0}`}
       placeholder={isLive(r) ? 'Message this agent' : 'Message it to pick up again'}
       submitLabel="send"
-      onSubmit={(text: string) => void sendTo($, r, text)}
+      onSubmit={(text: string) => void sendTo($, agentId, isLive(r), text)}
     />
   )
 }
@@ -417,7 +421,8 @@ function talk($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
         Starting. Its messages show here once it runs.
       </Text>
     )
-  const c = b.chat?.agentId === r.agentId ? b.chat : null
+  const agentId = r.agentId
+  const c = b.chat?.agentId === agentId ? b.chat : null
   return (
     <Box key="talk" flexDirection="column" marginTop={1} gap={1}>
       <Text key="talk-head" color="subtle">
@@ -426,9 +431,9 @@ function talk($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
       {chatLines(els, c)}
       <Box key="say-row" flexDirection="row" gap={1}>
         <Box key="say-box" flexGrow={1} flexShrink={1}>
-          {sayBox($, els, r, c)}
+          {sayBox($, els, r, agentId, c)}
         </Box>
-        {isLive(r) ? <Button key={`stop:${r.id}`} label="Stop" onPress={() => stopAgent($, r)} /> : null}
+        {isLive(r) ? <Button key={`stop:${r.id}`} label="Stop" onPress={() => stopAgent($, agentId)} /> : null}
       </Box>
       {c === null || c.note === null ? null : (
         <Text key="note" color="subtle" wrap="wrap">
@@ -649,7 +654,7 @@ function paneHooks(on: On) {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text } = els
-    const [rows, shown, talking, t, window, finishedShown] = await Promise.all([
+    const [rows, shown, openChat, t, window, finishedShown] = await Promise.all([
       read($, agents),
       read($, openAgent),
       read($, chat),
@@ -669,7 +674,7 @@ function paneHooks(on: On) {
     const b: Board = {
       rows,
       shown,
-      chat: talking,
+      chat: openChat,
       t,
       window,
       isFinishedShown: finishedShown,
