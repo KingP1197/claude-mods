@@ -2,13 +2,54 @@
 // validator follows `$` only within one file, so the hooks live in register.tsx.
 // A card appears when an agent spawns. Finished cards stay until the next batch
 // starts, that is, until an agent spawns while none is running.
-import type { AgentInfo, AgentStatus, ModelUsage, SessionMessage, ToolSpec } from 'claude-code'
+import type { AgentInfo, AgentStatus, ModelUsage, ToolSpec } from 'claude-code'
 
-import type { AgentRow, AgentState, AgentTokens, ChatLine, SentLine, Step, StepStatus } from '../types'
-import type { Hat } from './critter'
+import type { AgentRow, AgentState, AgentTokens, Step, StepStatus } from '../types'
+import type { BarKind, Hat } from './critter'
 
 export const PANE = 'agent-board'
 export const COMMAND = 'agent-board'
+
+// The board's button keys. A first click on an unfocused board arrives only as focus landing
+// on one of these, so the focus hook reads the button back from its key.
+export const nameKey = (id: string) => `name:${id}`
+export const stopKey = (id: string) => `stop:${id}`
+export const FINISHED_KEY = 'toggle-finished'
+export const moreKey = (id: string) => `more:${id}`
+export const earlierKey = (id: string) => `earlier:${id}`
+/** An Agent call's target: it opens the Card of the row `id`, the agent the call started. */
+export const childKey = (id: string) => `child:${id}`
+export const sectionKey = (id: string, which: SectionName) => `section:${id}:${which}`
+
+/** The two sections of an open card that close; its footer does not. */
+export type SectionName = 'brief' | 'transcript'
+
+type Pressed =
+  | { kind: 'name'; id: string }
+  | { kind: 'stop'; id: string }
+  | { kind: 'more'; id: string }
+  | { kind: 'earlier'; id: string }
+  | { kind: 'child'; id: string }
+  | { kind: 'section'; id: string; which: SectionName }
+  | { kind: 'finished' }
+
+const PLAIN_KINDS = ['name', 'stop', 'more', 'earlier', 'child'] as const
+const SECTION_NAMES: readonly SectionName[] = ['brief', 'transcript']
+
+/** The section button a key names: its card and which section it closes. */
+function sectionPress(key: string | undefined): Pressed | null {
+  const m = /^section:(.+):([a-z]+)$/.exec(key ?? '')
+  const which = SECTION_NAMES.find((n) => n === m?.[2])
+  return m === null || which === undefined ? null : { kind: 'section', id: m[1] ?? '', which }
+}
+
+/** The button a key names, or null for an element that is no button, such as the message box. */
+export function buttonOf(key: string | undefined): Pressed | null {
+  if (key === FINISHED_KEY) return { kind: 'finished' }
+  const m = /^([a-z]+):(.+)$/.exec(key ?? '')
+  const kind = PLAIN_KINDS.find((k) => k === m?.[1])
+  return kind === undefined ? sectionPress(key) : { kind, id: m?.[2] ?? '' }
+}
 
 // Subagents get no to-do tools, so the board gives them its own: a whole list of steps per call.
 const TOOL_NAME = 'report_progress'
@@ -133,36 +174,42 @@ export function tokensLine(r: AgentRow): string {
     return isLive(r) ? 'Tokens: none yet. The count starts when its first request answers.' : 'Tokens: none reported.'
   const when = isLive(r) ? 'now' : 'at the end'
   const reqs = `${t.requests} request${t.requests === 1 ? '' : 's'}`
-  return `Tokens: ${short(t.context)} in its context ${when} · ${short(t.total)} used in all, over ${reqs} · ${short(t.output)} written by it`
+  return `Tokens: ${short(t.context)} in its context ${when} | ${short(t.total)} used in all, over ${reqs} | ${short(t.output)} written by it`
 }
 
-/** The mark at a card's right edge, and its color. */
-export const MARK: Record<AgentState, { glyph: string; color: string }> = {
-  running: { glyph: '●', color: 'success' },
-  idle: { glyph: '◌', color: 'subtle' },
-  done: { glyph: '✓', color: 'success' },
-  failed: { glyph: '✗', color: 'error' },
-  stopped: { glyph: '■', color: 'subtle' },
-  lost: { glyph: '?', color: 'warning' },
+/** The mark at a card's right edge, with the word that names the state, both in the state's colour.
+ *  Only the running word is bold: Claude's colour on text is bold throughout the design system.
+ *  `short` is the word where the full one does not fit beside the name (see `stateWord` in header.ts):
+ *  Running reads `live`, Waiting `idle`, Failed `fail`, Stopped `stop`; Done and Lost are short already. */
+export const MARK: Record<
+  AgentState,
+  { glyph: string; word: string; short: string; color: string; isWordBold: boolean }
+> = {
+  running: { glyph: '●', word: 'Running', short: 'live', color: 'claude', isWordBold: true },
+  idle: { glyph: '◌', word: 'Waiting', short: 'idle', color: 'inactive', isWordBold: false },
+  done: { glyph: '✓', word: 'Done', short: 'Done', color: 'success', isWordBold: false },
+  failed: { glyph: '✗', word: 'Failed', short: 'fail', color: 'error', isWordBold: false },
+  stopped: { glyph: '■', word: 'Stopped', short: 'stop', color: 'inactive', isWordBold: false },
+  lost: { glyph: '?', word: 'Lost', short: 'Lost', color: 'warning', isWordBold: false },
 }
 
-/** An effort level's name on the board, its color, and the critter's hat. */
-export type Tier = { label: string; color: string; hat: Hat }
+/** Which fill a card's bar wears: orange while it runs, red when it failed, grey once it ended otherwise. */
+export const barKindOf = (state: AgentState): BarKind =>
+  state === 'running' || state === 'idle' ? 'live' : state === 'failed' ? 'failed' : 'done'
 
-const TIERS: Record<string, Tier> = {
-  low: { label: 'light', color: '#3fb27f', hat: 'light' },
-  medium: { label: 'medium', color: '#4c8df6', hat: 'medium' },
-  high: { label: 'careful', color: '#d9902f', hat: 'careful' },
-  xhigh: { label: 'heavy', color: '#e5534b', hat: 'heavy' },
-  max: { label: 'max', color: '#a371f7', hat: 'max' },
-}
+/** The terminal's bar cannot draw the Svg's hex, so each kind takes a theme key. */
+export const BAR_KEY: Record<BarKind, string> = { live: 'claude', done: 'inactive', failed: 'error' }
 
-/** Effort names the tier: low light, medium medium, high careful, xhigh heavy, max max. */
-export const tierOf = (effort: string | null): Tier =>
-  (effort === null ? undefined : TIERS[effort]) ?? { label: 'tier ?', color: '#8b949e', hat: 'none' }
+/** An effort level as the board shows it: its name and the critter's hat. */
+export type Tier = { label: string; hat: Hat }
 
-export const effortText = (r: AgentRow) =>
-  r.effort === null ? 'effort ?' : r.isEffortInherited ? `${r.effort} (session)` : r.effort
+const HATS: Record<string, Hat> = { low: 'light', medium: 'medium', high: 'careful', xhigh: 'heavy', max: 'max' }
+
+/** The card names the real effort level; each level keeps its own hat. */
+export const tierOf = (effort: string | null): Tier => ({
+  label: effort ?? 'effort —',
+  hat: (effort === null ? undefined : HATS[effort]) ?? 'none',
+})
 
 /** A TodoWrite call's list, which replaces the whole list. */
 export const stepsFromTodos = (todos: readonly { content: string; status: StepStatus }[]): Step[] =>
@@ -186,13 +233,16 @@ export function changeStep(
   return steps.map((s) => (s.id !== id ? s : { ...s, status: status ?? s.status, title: change.title ?? s.title }))
 }
 
-/** `3/5 · Hero copy`: items done of all, then the one in progress. Null without a list. */
-export function stepLine(steps: readonly Step[] | undefined): string | null {
+/** `3/5 | Hero copy`: items done of all, then the one in progress. Null without a list. */
+function stepLine(steps: readonly Step[] | undefined): string | null {
   if (steps === undefined || steps.length === 0) return null
   const done = steps.filter((s) => s.status === 'completed').length
   const current = steps.find((s) => s.status === 'in_progress')
-  return `${done}/${steps.length}${current === undefined ? '' : ` · ${current.title}`}`
+  return `${done}/${steps.length}${current === undefined ? '' : ` | ${current.title}`}`
 }
+
+/** The card's step line: the count done and the step in progress. How the agent ended is the header's word to say. */
+export const cardLine = (r: AgentRow): string | null => stepLine(r.steps)
 
 /** How full the card's bar is: whole when done, else its to-do list's share done. Null draws no bar. */
 export function progress(r: AgentRow): number | null {
@@ -202,13 +252,19 @@ export function progress(r: AgentRow): number | null {
   return steps.filter((s) => s.status === 'completed').length / steps.length
 }
 
-/** `ctx 2% · 44k tok · 0:27`: context share of the window, tokens used in all, time. */
-export function metricsLine(r: AgentRow, t: number, window: number | null): string {
+/**
+ * `ctx 2% | 44k tok | 0:27`: context share of the window, tokens used in all, time. In a row `cells` wide the last
+ * parts drop first, the time and then the tokens, so the line never passes the row's right edge; a row too narrow
+ * for even the first part gets an empty line.
+ */
+export function metricsLine(r: AgentRow, t: number, window: number | null, cells: number): string {
   const time = clockText((r.endedAt ?? t) - r.startedAt)
   const k = r.tokens
-  if (k === undefined) return time
+  if (k === undefined) return time.length <= cells ? time : ''
   const ctx = window !== null && window > 0 ? `${Math.round((k.context / window) * 100)}%` : short(k.context)
-  return `ctx ${ctx} · ${short(k.total)} tok · ${time}`
+  const parts = [`ctx ${ctx}`, `${short(k.total)} tok`, time]
+  while (parts.length > 0 && parts.join(' | ').length > cells) parts.pop()
+  return parts.join(' | ')
 }
 
 /** The cards at the top: how many agents, tokens used in all, and first start to last end. */
@@ -265,47 +321,6 @@ export function reconcile(rows: readonly AgentRow[], infos: readonly AgentInfo[]
     const state = stateOf(info.status, r.isTeammate)
     return state === r.state ? r : moveTo(r, state, t)
   })
-}
-
-/** How many of an agent's messages its opened card shows. */
-const SHOWN_LINES = 3
-/** A longer message is cut to this many characters, so one message cannot fill the board. */
-const LINE_CHARS = 280
-
-const clip = (s: string) => (s.length > LINE_CHARS ? `${s.slice(0, LINE_CHARS - 1).trimEnd()}…` : s)
-
-/** `mcp__agent-board__report_progress` reads `report_progress`; a built-in tool keeps its name. */
-const toolName = (t: string) => (t.startsWith('mcp__') ? t.slice(t.lastIndexOf('__') + 2) : t)
-
-/** Claude Code's marker in a stopped agent's conversation. It reads as a user message, but nobody wrote it. */
-const isStopMarker = (text: string) => /^\[Request interrupted by user[^\]]*\]$/.test(text)
-
-/** One message as a line, or null for one with nothing to read (a tool's answer back to the agent, or a stop). */
-function lineOf(m: SessionMessage): ChatLine | null {
-  // The board's own nudge rides on every brief; the user did not write it.
-  const text = m.text.replace(NUDGE, '').trim()
-  if (m.role === 'user') return text === '' || isStopMarker(text) ? null : { who: 'to-agent', text: clip(text) }
-  if (text !== '') return { who: 'agent', text: clip(text) }
-  const tools = [...new Set(m.toolUses.map((u) => toolName(u.tool)))]
-  return tools.length === 0 ? null : { who: 'agent', text: `Used ${tools.join(', ')}` }
-}
-
-const sentLine = (s: SentLine): ChatLine => ({ who: 'to-agent', text: clip(s.text) })
-
-/** An agent's last few messages with something to read, oldest first, the user's own sent ones each in its
- *  place. One recorded past the end of what was read back still shows, last. A delivered message can show in
- *  the conversation read back while it waits for the agent; then the board's own copy is left out. */
-export function recentLines(messages: readonly SessionMessage[], sentHere: readonly SentLine[]): ChatLine[] {
-  const isReadBack = (s: SentLine) =>
-    messages.some((m, i) => i >= s.after && m.role === 'user' && m.text.includes(s.text))
-  const shown = sentHere.filter((s) => !isReadBack(s))
-  const sentAfter = (n: number) => shown.filter((s) => s.after === n).map(sentLine)
-  const lines = [
-    ...sentAfter(0),
-    ...messages.flatMap((m, i) => [lineOf(m), ...sentAfter(i + 1)]),
-    ...shown.filter((s) => s.after > messages.length).map(sentLine),
-  ]
-  return lines.filter((l) => l !== null).slice(-SHOWN_LINES)
 }
 
 /** A finished agent woken by a message runs again; a live one is unchanged. */

@@ -1,6 +1,8 @@
 // The board's pictures, as SVG strings: a pixel critter whose hat shows the effort tier, and a progress bar.
 // Nothing here calls the engine.
 
+import { BAR_DONE, BAR_LIVE, BAR_TRACK, CRITTER_INK, FAILED_RED } from './colors'
+
 export type Hat = 'light' | 'medium' | 'careful' | 'heavy' | 'max' | 'none'
 
 // One letter per pixel, twelve across; a dot is see-through. Each hat is three rows, the body six.
@@ -20,19 +22,13 @@ const HATS: Record<Hat, readonly string[]> = {
 
 const BODY = ['..bbbbbbbb..', '..bebbbbeb..', 'bbbbbbbbbbbb', '..bbbbbbbb..', '..b.b..b.b..', '..b.b..b.b..']
 
-const INK: Record<string, string> = {
-  b: '#e8836b',
-  e: '#2b1d1a',
-  g: '#2fa36b',
-  p: '#c9d1d9',
-  F: '#e5534b',
-  w: '#f0f0f0',
-  u: '#4c8df6',
-  k: '#1e293b',
-  y: '#f2c94c',
-  n: '#7a5230',
-  L: '#f5e7a1',
-  c: '#a371f7',
+// The pixel letter that carries each hat's own colour (the medium captain's hat is white, so its blue band).
+const HAT_INK: Record<Hat, string | null> = { light: 'g', medium: 'u', careful: 'y', heavy: 'n', max: 'c', none: null }
+
+/** The colour a hat is drawn in, for the terminal's text marks. Null for no hat. */
+export function hatColor(hat: Hat): string | null {
+  const letter = HAT_INK[hat]
+  return letter === null ? null : (CRITTER_INK[letter] ?? null)
 }
 
 const COLS = 12
@@ -49,7 +45,7 @@ export function critterSvg(hat: Hat, isFaded: boolean): string {
   const rows = [...HATS[hat], ...BODY]
   const rects = rows.flatMap((row, y) =>
     [...row].flatMap((ch, x) => {
-      const fill = INK[ch]
+      const fill = CRITTER_INK[ch]
       return fill === undefined ? [] : [`<rect x="${x}" y="${y}" width="1" height="1" fill="${fill}"/>`]
     }),
   )
@@ -59,12 +55,16 @@ export function critterSvg(hat: Hat, isFaded: boolean): string {
   )
 }
 
-/** A bar filled to `fraction` in `color`, over a grey track. It stretches to the width of its box. */
-export function barSvg(fraction: number, color: string): string {
+/** The bar's fill by state: while running; finished or stopped; failed. Fixed colours, since an Svg cannot read the theme. */
+export type BarKind = 'live' | 'done' | 'failed'
+const BAR_FILL: Record<BarKind, string> = { live: BAR_LIVE, done: BAR_DONE, failed: FAILED_RED }
+
+/** A bar filled to `fraction` in its kind's colour, over a see-through grey track. It stretches to the width of its box. */
+export function barSvg(fraction: number, kind: BarKind): string {
   const filled = Math.round(Math.min(1, Math.max(0, fraction)) * 1000)
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="${BAR_H}" viewBox="0 0 1000 ${BAR_H}" preserveAspectRatio="none" style="display:block">` +
-    `<rect width="1000" height="${BAR_H}" fill="#8b949e" fill-opacity="0.3"/>` +
-    `<rect width="${filled}" height="${BAR_H}" fill="${color}"/></svg>`
+    `<rect width="1000" height="${BAR_H}" fill="${BAR_TRACK}"/>` +
+    `<rect width="${filled}" height="${BAR_H}" fill="${BAR_FILL[kind]}"/></svg>`
   )
 }

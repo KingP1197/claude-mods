@@ -1,10 +1,11 @@
 // Desktop version of ~/.claude/statusline-command.sh.
-// Line 1: branch, 5-hour and 7-day rate limits, context used, cache warm or cold; Side question, Compact and Handoff buttons at its right end.
-// Hovering the cache item shows when it goes cold and a Keep warm button, or once cold, what the next message re-stores.
-// Side question opens a panel that asks Claude over a copy of the chat, out of the main agent's sight.
-// Line 2: context bar split by source, and a Details button.
+// Line 1: branch, 5-hour and 7-day rate limits, context used, cache warm or cold; Side question, Compact and Write handoff buttons at its right end.
+// As the band narrows, figures drop out: branch, then 7d, then the cache item, then context shortens (fit.ts).
+// Hovering the cache item shows when it goes cold and the Auto warm switch, or once cold, what the next message re-stores.
+// Side question opens an Ask box under the Band's two lines; the Side questions panel still asks Claude over a copy of the chat, out of the main agent's sight.
+// Line 2: context bar split by source, and a Show details button.
 // On desktop the bar is an SVG whose pieces show a tooltip on hover.
-// Colors follow the terminal script: green under 50%, yellow under 80%, red above.
+// Colors: plain text under 50% (low usage is not news), warning under 80%, error above.
 // Every hook lives in this file: the validator follows `$` only within one file.
 import { atom, read, update } from 'claude-code'
 import type {
@@ -19,9 +20,26 @@ import type {
   SessionUsage,
 } from 'claude-code'
 
-import type { CacheSeen, Handoff, Line, Part, Side, SideTurn } from '../types'
-import { KEEP_WARM_PROMPT, TICK_MS, TTL_SCRIPT, WARM_COLOR, cacheView, eastern, prefixOf, ttlFrom } from './cache'
+import type { AutoWarm, CacheSeen, Handoff, Line, Part, Side, SideTurn } from '../types'
+import {
+  AUTO_MARK,
+  AUTO_WARM_SPAN,
+  FIVE_MIN,
+  KEEP_WARM_PROMPT,
+  NO_AUTO_WARM,
+  ONE_HOUR,
+  PING_GAP,
+  PING_MARGIN_MIN,
+  TICK_MS,
+  TTL_SCRIPT,
+  autoWarmOf,
+  cacheView,
+  eastern,
+  prefixOf,
+  ttlFrom,
+} from './cache'
 import { COMPACT_PROMPT } from './compact'
+import { answerRows, cutAnswer, cutQuestion, fit, SEP_TEXT, textRows, type Shown } from './fit'
 import type { AskBoxPost, AskBoxProps } from './askbox'
 import { ASK_BOX, NO_SIDE, SIDE_PANE, forkFailure, sideOf, sidePrompt } from './side'
 import { CAP, FIRST_LINE, HANDOFF_PROMPT, IDLE, TOOL, TOOL_SPEC, estimateTokens, fail, ok, textOf } from './handoff'
@@ -33,7 +51,10 @@ const now = atom({ plugin: 'desk-status', key: 'now' } as const, 0)
 const handoff = atom({ plugin: 'desk-status', key: 'handoff' } as const, IDLE)
 const isCompacting = atom({ plugin: 'desk-status', key: 'isCompacting' } as const, false)
 const side = atom({ plugin: 'desk-status', key: 'side' } as const, NO_SIDE)
+const isSideOpen = atom({ plugin: 'desk-status', key: 'isSideOpen' } as const, false)
+const keyboardLeaves = atom({ plugin: 'desk-status', key: 'keyboardLeaves' } as const, 0)
 const cache = atom({ plugin: 'desk-status', key: 'cache' } as const, null as CacheSeen | null)
+const autoWarm = atom({ plugin: 'desk-status', key: 'autoWarm' } as const, NO_AUTO_WARM)
 
 // One color per source, biggest first. Readable on dark and light.
 // Neighbors sit far apart in hue, so the two biggest sources (side by side in the bar) never look alike.
@@ -42,8 +63,9 @@ const PALETTE = ['#7aa2f7', '#ff9e64', '#9ece6a', '#f7768e', '#bb9af7', '#e0af68
 const FREE = '#4b5563'
 // Terminal bar length when the band's width is unknown.
 const TEXT_BAR_CELLS = 40
-// Cells kept clear on the terminal bar's line for the gap, the Details button and its marks.
-const TEXT_BAR_RESERVE = 16
+// Cells kept clear on the terminal bar's line: the two-cell gap, `[ Show details ]` (16, the same as
+// `[ Hide details ]`) and three to spare. A bar any wider wraps its last cell onto a row of its own.
+const TEXT_BAR_RESERVE = 21
 // Desktop bar height in CSS pixels. The picture sets it: a box can't be sized in pixels, and drew round corners.
 // No width: the bar stretches to fill its row, so Details sits at the right edge.
 const BAR_H = 9
@@ -53,7 +75,7 @@ const BAR_PARTS = 10_000
 const MIN_PARTS = 20
 
 // Higher used is worse, for context and both rate limits.
-const level = (pct: number) => (pct >= 80 ? 'error' : pct >= 50 ? 'warning' : 'success')
+const level = (pct: number) => (pct >= 80 ? 'error' : pct >= 50 ? 'warning' : 'text')
 
 const short = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
@@ -163,7 +185,7 @@ async function startHandoff($: EngineInterface, surface: RenderSurface) {
   // Claimed inside one update, so two presses at once cannot both queue a request.
   const after = await update($, handoff, (h): Handoff => (h.phase === 'idle' ? { phase: 'queued', surface } : IDLE))
   if (after.phase === 'idle') {
-    $.ui.toast('Handoff reset. Press Handoff again to write a new one.')
+    $.ui.toast('Handoff reset. Press Write handoff again to write a new one.')
     return
   }
   const cancel = async () => {
@@ -208,18 +230,66 @@ async function learnTtl($: EngineInterface, transcriptPath: string) {
   }
 }
 
-// The Keep warm press: a tiny prompt, whose request reads the whole cache and restarts its clock.
-async function keepWarm($: EngineInterface) {
-  const c = await read($, cache)
-  const t = await $.clock.now()
-  if (c !== null && t - c.sentAt < 60_000) {
-    $.ui.toast('The cache was refreshed under a minute ago.')
+// Every read of the switch goes through this, so a saved value missing a field is brought up to date.
+const readAuto = async ($: EngineInterface): Promise<AutoWarm> => autoWarmOf(await read($, autoWarm))
+
+// The Auto warm press: off when on; else on until three hours from now. Only the hour-long cache can be kept warm.
+async function pressAutoWarm($: EngineInterface) {
+  if ((await readAuto($)).isOn) {
+    await update($, autoWarm, () => NO_AUTO_WARM)
     return
   }
-  void $.prompt.submit({ text: KEEP_WARM_PROMPT }).then(
-    (r) => (r.drop === undefined ? undefined : $.ui.toast('The keep-warm message was refused.')),
-    () => $.ui.toast('The keep-warm message could not be sent.'),
+  const c = await read($, cache)
+  if (c?.ttlMs !== ONE_HOUR) {
+    $.ui.toast('Auto warm needs the hour-long cache. Yours lasts 5 minutes now.')
+    return
+  }
+  const t = await $.clock.now()
+  await update($, autoWarm, () => ({ isOn: true, offAt: t + AUTO_WARM_SPAN }))
+}
+
+// The Keep-warm ping: a tiny prompt, whose request reads the whole cache and restarts its clock.
+// False comes back where the ping never entered, so nothing will answer it.
+function sendPing($: EngineInterface): Promise<boolean> {
+  return $.prompt.submit({ text: KEEP_WARM_PROMPT }).then(
+    (r) => {
+      if (r.drop === undefined) return true
+      $.ui.toast('The keep-warm message was refused.')
+      return false
+    },
+    () => {
+      $.ui.toast('The keep-warm message could not be sent.')
+      return false
+    },
   )
+}
+
+/** The band's last Keep-warm ping: when it went, and whether it still waits for its answer. */
+type Ping = { at: number; isWaiting: boolean }
+const NO_PING: Ping = { at: Number.NEGATIVE_INFINITY, isWaiting: false }
+
+// Each tick, while Auto warm is on: ping once the hour-long cache has ten minutes or fewer left. True comes back when
+// this tick should ping. A ping that waits (queued behind a long tool call, say) holds the next until its reply
+// restarts the cache's clock: a request sent after the ping is that reply.
+async function autoWarmTick($: EngineInterface, t: number, ping: Ping): Promise<boolean> {
+  const auto = await readAuto($)
+  if (!auto.isOn) return false
+  const c = await read($, cache)
+  // Off for good: the off time has passed, or the cache now lasts five minutes, which a ten-minute margin cannot cover.
+  if (t >= auto.offAt || c?.ttlMs === FIVE_MIN) {
+    await update($, autoWarm, () => NO_AUTO_WARM)
+    return false
+  }
+  return isPingDue(c, t, ping)
+}
+
+// Whether the cache is at the point to ping: hour-long and warm with ten minutes or fewer left, the guard passed,
+// and the last ping answered (the cache's last request came after it) or never sent.
+function isPingDue(c: CacheSeen | null, t: number, ping: Ping): boolean {
+  if (c === null || c.ttlMs !== ONE_HOUR || t - ping.at < PING_GAP) return false
+  if (ping.isWaiting && c.sentAt < ping.at) return false
+  const view = cacheView(c, t)
+  return view.state === 'warm' && view.minutesLeft <= PING_MARGIN_MIN
 }
 
 // Saved state outlives a reload, so a value an older version saved can lack newer fields or hold old turns.
@@ -227,10 +297,20 @@ async function keepWarm($: EngineInterface) {
 const readSide = async ($: EngineInterface): Promise<Side> => sideOf(await read($, side))
 const updateSide = ($: EngineInterface, fn: (s: Side) => Side) => update($, side, (s) => fn(sideOf(s)))
 
-// The Side question button's press: open the panel with the keyboard in it.
-async function openSide($: EngineInterface) {
+// The Side question button's press: show or fold the Ask box under the Band's two lines.
+async function toggleSide($: EngineInterface) {
+  await update($, isSideOpen, (open) => !open)
+}
+
+// Open in pane: the existing Side questions pane, which draws the whole Thread.
+async function openSidePane($: EngineInterface) {
   const r = await $.ui.open({ id: SIDE_PANE, title: 'Side questions', focus: true })
   if (!r.isPlaced) $.ui.toast(`Could not open the side panel (${r.reason}).`)
+}
+
+// Clear: empties the Thread. No confirmation: it holds side questions only, and the main chat is untouched.
+async function clearThread($: EngineInterface) {
+  await updateSide($, (s) => ({ ...s, turns: [] }))
 }
 
 // Enter in the panel: one tool-less request over a copy of the main chat, earlier side turns included.
@@ -292,7 +372,7 @@ async function noteCache($: EngineInterface, sentAt: number, usage: ModelUsage) 
 async function handoffTurnEnded($: EngineInterface) {
   if ((await read($, handoff)).phase !== 'writing') return
   await update($, handoff, () => IDLE)
-  $.ui.toast('The handoff was not copied. Press Handoff to try again.')
+  $.ui.toast('The handoff was not copied. Press Write handoff to try again.')
 }
 
 // The save_handoff tool: copy the handoff to the clipboard, or say why not.
@@ -327,9 +407,11 @@ type Band = {
   handoff: Handoff
   isCompacting: boolean
   cache: CacheSeen | null
+  auto: AutoWarm
   t: number
   surface: RenderSurface
   bodyColumns: number
+  isSideOpen: boolean
 }
 
 // A card under its parent, shown only while the pointer is over the parent. Unkeyed: the engine refused a keyed one.
@@ -355,7 +437,7 @@ function sep(els: ElementTable, k: string) {
   const { Text } = els
   return (
     <Text key={k} color="subtle">
-      {' | '}
+      {SEP_TEXT}
     </Text>
   )
 }
@@ -363,38 +445,48 @@ function sep(els: ElementTable, k: string) {
 function na(els: ElementTable, k: string, label: string) {
   const { Text } = els
   return (
-    <Text key={k} color="subtle">
+    <Text key={k} color="inactive">
       {label}
     </Text>
   )
 }
 
-// A figure in bold, or a dim stand-in when it is missing.
+// A figure in bold (or regular, for the branch), or a dim stand-in when it is missing.
 function stat(
   els: ElementTable,
   k: string,
   missing: string,
   text: string | null,
-  color: ReturnType<typeof level> | 'suggestion',
+  color: ReturnType<typeof level> | 'inactive',
+  isBold = true,
 ) {
   const { Text } = els
   if (text === null) return na(els, k, missing)
   return (
-    <Text key={k} color={color} bold>
+    <Text key={k} color={color} bold={isBold}>
       {text}
     </Text>
   )
 }
 
-const rateStat = (els: ElementTable, k: string, label: string, used: number | null) =>
-  stat(els, k, `${label} n/a`, used === null ? null : `${label} ${Math.round(used)}%`, level(used ?? 0))
+const rateText = (label: string, used: number | null) =>
+  used === null ? `${label} —` : `${label} ${Math.round(used)}%`
 
-function ctxLabel(els: ElementTable, f: Line) {
+const rateStat = (els: ElementTable, k: string, label: string, used: number | null) =>
+  stat(els, k, `${label} —`, used === null ? null : rateText(label, used), level(used ?? 0))
+
+// The context figure: in full, or short (`ctx 13%`) when the line is tight.
+const ctxText = (f: Line, isShort: boolean) => {
+  if (f.ctxUsed === null || f.ctxPercent === null) return isShort ? 'ctx —' : `0/${short(f.ctxWindow)} ctx`
+  return isShort ? `ctx ${f.ctxPercent}%` : `${short(f.ctxUsed)}/${short(f.ctxWindow)} ctx (${f.ctxPercent}%)`
+}
+
+function ctxLabel(els: ElementTable, f: Line, isShort: boolean) {
   const { Text } = els
-  if (f.ctxUsed === null || f.ctxPercent === null) return na(els, 'ctx', `0/${short(f.ctxWindow)} ctx`)
+  if (f.ctxUsed === null || f.ctxPercent === null) return na(els, 'ctx', ctxText(f, isShort))
   return (
     <Text key="ctx" color={level(f.ctxPercent)} bold>
-      {`${short(f.ctxUsed)}/${short(f.ctxWindow)} ctx (${f.ctxPercent}%)`}
+      {ctxText(f, isShort)}
     </Text>
   )
 }
@@ -434,14 +526,20 @@ function contextBar(els: ElementTable, b: Band) {
 }
 
 // Warm or cold; its card appears while the pointer is over the item.
-function cacheItem($: EngineInterface, els: ElementTable, seen: CacheSeen, t: number) {
+function cacheItem($: EngineInterface, els: ElementTable, seen: CacheSeen, auto: AutoWarm, t: number) {
   const { Box, Text, Button } = els
   const view = cacheView(seen, t)
   const lines =
     view.state === 'warm'
       ? [
           <Text key="cwhen">{`Goes cold at ${eastern(view.coldAt)} (in ${view.minutesLeft} min)`}</Text>,
-          <Button key="keepwarm" label="Keep warm" dimColor onPress={() => keepWarm($)} />,
+          ...(auto.isOn ? [<Text key="cauto">{`Auto warm on, off at ${eastern(auto.offAt)}`}</Text>] : []),
+          <Button
+            key="autowarm"
+            label={auto.isOn ? 'Turn auto warm off' : 'Turn auto warm on'}
+            dimColor
+            onPress={() => pressAutoWarm($)}
+          />,
         ]
       : [
           <Text key="cwhen">{`Went cold at ${eastern(view.coldAt)}`}</Text>,
@@ -449,7 +547,17 @@ function cacheItem($: EngineInterface, els: ElementTable, seen: CacheSeen, t: nu
         ]
   return (
     <Box key="cache" flexDirection="row">
-      <Text key="cstate" color={view.state === 'warm' ? WARM_COLOR : 'subtle'} bold>{`cache: ${view.state}`}</Text>
+      <Text
+        key="cstate"
+        color={view.state === 'warm' ? 'claude' : 'inactive'}
+        bold={view.state === 'warm'}
+      >{`cache ${view.state}`}</Text>
+      {auto.isOn ? sep(els, 's5') : null}
+      {auto.isOn ? (
+        <Text key="cmark" color={view.state === 'warm' ? 'claude' : 'inactive'} bold={view.state === 'warm'}>
+          {AUTO_MARK}
+        </Text>
+      ) : null}
       {hoverCard(els, lines)}
     </Box>
   )
@@ -459,7 +567,7 @@ function detailsList(els: ElementTable, f: Line) {
   const { Box, Text } = els
   return (
     <Box key="list" flexDirection="column">
-      <Text key="head" color="subtle">
+      <Text key="head" color="inactive">
         {f.isExact ? 'Exact count, by source:' : 'Estimate, by source:'}
       </Text>
       {(f.parts ?? []).map((p, i) => (
@@ -468,51 +576,83 @@ function detailsList(els: ElementTable, f: Line) {
             {'■ '}
           </Text>
           <Text key="nm">{p.name}</Text>
-          <Text key="tk" color="subtle">{`  ${short(p.tokens)}  ${pct(p.tokens, f.ctxWindow)}`}</Text>
+          <Text key="tk" color="inactive">{`  ${short(p.tokens)}  ${pct(p.tokens, f.ctxWindow)}`}</Text>
         </Box>
       ))}
     </Box>
   )
 }
 
-// Side question, Compact and Handoff, pinned to the right end of line 1.
+// The three buttons' labels now, which change while a job runs or the Ask box is open.
+const buttonLabels = (b: Band): [string, string, string] => [
+  b.isSideOpen ? 'Hide side question' : 'Side question',
+  b.isCompacting ? 'Compacting…' : 'Compact',
+  b.handoff.phase === 'idle' ? 'Write handoff' : 'Writing handoff…',
+]
+
+// Side question, Compact and Write handoff, pinned to the right end of line 1.
+// A Button takes no layout props, so each sits in a box that never shrinks: a squeezed button clipped its label.
 function actions($: EngineInterface, els: ElementTable, b: Band) {
   const { Box, Text, Button } = els
+  const [sideLabel, compactLabel, handoffLabel] = buttonLabels(b)
   return (
     <Box key="actions" flexDirection="row" flexShrink={0}>
-      <Button key="side" label="Side question" dimColor onPress={() => openSide($)} />
+      <Box key="sidebox" flexShrink={0}>
+        <Button key="side" label={sideLabel} dimColor onPress={() => toggleSide($)} />
+      </Box>
       <Text key="sgap">{'  '}</Text>
-      <Button
-        key="compact"
-        label={b.isCompacting ? 'Compacting…' : 'Compact'}
-        dimColor
-        onPress={() => startCompact($)}
-      />
+      <Box key="compactbox" flexShrink={0}>
+        <Button key="compact" label={compactLabel} dimColor onPress={() => startCompact($)} />
+      </Box>
       <Text key="agap">{'  '}</Text>
-      <Button
-        key="handoff"
-        label={b.handoff.phase === 'idle' ? 'Handoff' : 'Writing handoff…'}
-        dimColor
-        onPress={(press) => startHandoff($, press.surface)}
-      />
+      <Box key="handoffbox" flexShrink={0}>
+        <Button key="handoff" label={handoffLabel} dimColor onPress={(press) => startHandoff($, press.surface)} />
+      </Box>
     </Box>
   )
 }
 
+// Cells the buttons take, with one to spare so a miscount never wraps the line.
+// The terminal draws `[ label ]`, four cells around each label. The desktop's padding is a guess (two cells).
+const BUTTON_CHROME = { terminal: 4, desktop: 2 }
+const buttonsWidth = (b: Band) => {
+  const chrome = b.surface === 'terminal' ? BUTTON_CHROME.terminal : BUTTON_CHROME.desktop
+  // Two gaps of two cells between the three buttons.
+  return buttonLabels(b).reduce((sum, l) => sum + l.length + chrome, 0) + 4 + 1
+}
+
+// Which of line 1's figures fit the band's width. An unknown width (0) shows them all.
+function shownFigures(b: Band): Shown {
+  const f = b.figures
+  if (b.bodyColumns <= 0) return { isBranch: true, isRate7: true, isCache: true, isCtxShort: false }
+  return fit(b.bodyColumns, buttonsWidth(b), {
+    branch: (f.branch ?? 'no branch').length,
+    rate5: rateText('5h', f.rate5).length,
+    rate7: rateText('7d', f.rate7).length,
+    ctx: ctxText(f, false).length,
+    ctxShort: ctxText(f, true).length,
+    // `cache warm` and `cache cold` are the same length; Auto warm adds a separator and its mark.
+    cache: b.cache === null ? null : 'cache warm'.length + (b.auto.isOn ? SEP_TEXT.length + AUTO_MARK.length : 0),
+  })
+}
+
 // Line 1: the figures on the left, the buttons pinned to the right end.
+// As the band narrows the figures drop out (fit.ts), so none wrap into a column and no button clips.
 function firstRow($: EngineInterface, els: ElementTable, b: Band) {
   const { Box } = els
-  const item = b.cache === null ? null : cacheItem($, els, b.cache, b.t)
+  const f = b.figures
+  const shown = shownFigures(b)
+  const item = b.cache === null || !shown.isCache ? null : cacheItem($, els, b.cache, b.auto, b.t)
   return (
     <Box key="row1" flexDirection="row" justifyContent="space-between" alignItems="center" width="100%">
-      <Box key="stats" flexDirection="row" flexWrap="wrap" flexShrink={1}>
-        {stat(els, 'br', 'no branch', b.figures.branch, 'suggestion')}
-        {sep(els, 's1')}
-        {rateStat(els, 'r5', '5h', b.figures.rate5)}
-        {sep(els, 's2')}
-        {rateStat(els, 'r7', '7d', b.figures.rate7)}
+      <Box key="stats" flexDirection="row" flexShrink={1}>
+        {shown.isBranch ? stat(els, 'br', 'no branch', f.branch, 'inactive', false) : null}
+        {shown.isBranch ? sep(els, 's1') : null}
+        {rateStat(els, 'r5', '5h', f.rate5)}
+        {shown.isRate7 ? sep(els, 's2') : null}
+        {shown.isRate7 ? rateStat(els, 'r7', '7d', f.rate7) : null}
         {sep(els, 's3')}
-        {ctxLabel(els, b.figures)}
+        {ctxLabel(els, f, shown.isCtxShort)}
         {item === null ? null : sep(els, 's4')}
         {item}
       </Box>
@@ -531,7 +671,7 @@ function secondRow($: EngineInterface, els: ElementTable, b: Band) {
       <Text key="gap">{'  '}</Text>
       <Button
         key="details"
-        label={b.isOpen ? 'Hide' : 'Details'}
+        label={b.isOpen ? 'Hide details' : 'Show details'}
         dimColor
         onPress={async () => {
           const opening = !b.isOpen
@@ -543,20 +683,20 @@ function secondRow($: EngineInterface, els: ElementTable, b: Band) {
   )
 }
 
-function sideReply(els: ElementTable, t: SideTurn, key: string) {
+function sideReply(els: ElementTable, t: SideTurn, key: string, cut = (answer: string) => answer) {
   const { Text, Markdown } = els
   switch (t.state) {
     case 'answered':
-      return <Markdown key={key} text={t.answer} />
+      return <Markdown key={key} text={cut(t.answer)} />
     case 'failed':
       return (
         <Text key={key} color="error">
-          {t.failure}
+          {cut(t.failure)}
         </Text>
       )
     case 'pending':
       return (
-        <Text key={key} dimColor>
+        <Text key={key} color="inactive">
           Thinking…
         </Text>
       )
@@ -567,8 +707,8 @@ function sideThread(els: ElementTable, turns: Side['turns']) {
   const { Box, Text } = els
   return turns.map((t, i) => (
     <Box key={`t${i}`} flexDirection="column">
-      {/* Yours in blue, Claude's under an orange label: the two colors tell them apart. */}
-      <Text key={`q${i}`} bold color="suggestion">{`You: ${t.question}`}</Text>
+      {/* Yours in plain bold text, Claude's under its own colored label. */}
+      <Text key={`q${i}`} bold color="text">{`You: ${t.question}`}</Text>
       <Text key={`c${i}`} bold color="claude">
         Claude:
       </Text>
@@ -580,51 +720,204 @@ function sideThread(els: ElementTable, turns: Side['turns']) {
 // Terminal and desktop get the drawn box (askbox.tsx), full width and wrapping.
 // VS Code has no drawn boxes, so it gets the engine's field with the whole draft shown under it.
 // The mobile app draws no field yet: its table still hands one out, which draws nothing.
-function askField(
+const hasDrawnBox = (els: ElementTable, surface: RenderSurface) =>
+  (surface === 'terminal' || surface === 'desktop') && 'Client' in els && els.Client !== undefined
+const hasTypingField = (els: ElementTable, surface: RenderSurface) =>
+  surface !== 'mobile' && 'Input' in els && els.Input !== undefined
+
+/** What the Ask box needs from whoever draws it. */
+type AskSetup = {
+  s: Side
+  placeholder: string
+  /** Whether the surface holds the keyboard: the one sign the box gets that it lost it. */
+  isPaneFocused: boolean
+  /** Keyboard moves out of the Band so far. */
+  leaves: number
+  /** Whether the box sits beside its label in the Band, not in the pane. */
+  isInBand: boolean
+}
+
+// The drawn box. Beside its label in the Band it takes the rest of the row, and the Band's hint says
+// to click, so the box leaves its own click line out; in the panel it takes the whole width.
+function drawnBox(els: ElementTable, a: AskSetup) {
+  if (!('Client' in els) || els.Client === undefined) return null
+  const props = {
+    draft: a.s.draft,
+    seq: a.s.draftSeq,
+    placeholder: a.placeholder,
+    isPaneFocused: a.isPaneFocused,
+    leaves: a.leaves,
+    hasClickLine: !a.isInBand,
+  } satisfies AskBoxProps
+  const size = a.isInBand ? ({ flexGrow: 1 } as const) : ({ width: '100%' } as const)
+  return <els.Client key={ASK_BOX} {...size} module="./askbox.tsx" props={props} />
+}
+
+// The engine's own field, with the draft shown whole under it. Enter asks.
+function typingField($: EngineInterface, els: ElementTable, s: Side, placeholder: string) {
+  const { Box, Text } = els
+  if (!('Input' in els) || els.Input === undefined) return null
+  return (
+    <Box key="askfield" flexDirection="column">
+      <els.Input
+        key="ask"
+        value={s.draft}
+        placeholder={placeholder}
+        submitLabel="ask"
+        autoFocus
+        onInput={(v) => updateSide($, (cur) => ({ ...cur, draft: v }))}
+        onSubmit={(v) => askSide($, v)}
+      />
+      {s.draft.trim() === '' ? null : (
+        <Box key="draftview">
+          <Text key="drafttext" dimColor wrap="wrap">
+            {s.draft}
+          </Text>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+/** The Ask box's placeholder: the first question, or a follow-up once the Thread has an Exchange. */
+const placeholderOf = (s: Side) => (s.turns.length === 0 ? 'Ask about this chat…' : 'Ask a follow-up…')
+
+const MOBILE_NOTICE = 'Type side questions in the desktop app or the terminal.'
+
+function askField($: EngineInterface, els: ElementTable, surface: RenderSurface, a: AskSetup) {
+  if (hasDrawnBox(els, surface)) return drawnBox(els, a)
+  if (hasTypingField(els, surface)) return typingField($, els, a.s, a.placeholder)
+  return (
+    <els.Text key="ask" dimColor>
+      {MOBILE_NOTICE}
+    </els.Text>
+  )
+}
+
+/** The Ask box's label in the Band: `Side question` first, `Follow-up` once the Thread has an Exchange. */
+const labelOf = (s: Side) => (s.turns.length === 0 ? 'Side question' : 'Follow-up')
+
+// The cells the Ask box takes beside the draft: its label, the margin after it, its borders, padding and cursor.
+const askBoxCells = (s: Side) => labelOf(s).length + 6
+
+// The cells a label (`You`, `Claude`) takes before its text.
+const LABEL_CELLS = 7
+
+// One line of the Exchange: a label in a fixed-width cell, then its text.
+function exchangeLine(
+  els: ElementTable,
+  name: string,
+  label: { text: string; color: 'text' | 'claude' },
+  body: JSX.Element,
+) {
+  const { Box, Text } = els
+  return (
+    <Box key={`${name}line`} flexDirection="row">
+      <Box key={`${name}label`} width={LABEL_CELLS} flexShrink={0}>
+        <Text bold color={label.color}>
+          {label.text}
+        </Text>
+      </Box>
+      <Box key={`${name}text`} flexGrow={1}>
+        {body}
+      </Box>
+    </Box>
+  )
+}
+
+// The latest Exchange: `You` beside the question, `Claude` beside the answer.
+function sideExchange(els: ElementTable, t: SideTurn, rows: number, columns: number) {
+  const { Box, Text } = els
+  return (
+    <Box key="exchange" flexDirection="column">
+      {exchangeLine(
+        els,
+        'you',
+        { text: 'You', color: 'text' },
+        <Text wrap="wrap">{cutQuestion(t.question, columns)}</Text>,
+      )}
+      {exchangeLine(
+        els,
+        'claude',
+        { text: 'Claude', color: 'claude' },
+        sideReply(els, t, 'reply', (answer) => cutAnswer(answer, rows, columns)),
+      )}
+    </Box>
+  )
+}
+
+// The Thread line above the latest Exchange: how many Exchanges are not shown, on the leading edge.
+function threadLine($: EngineInterface, els: ElementTable, hidden: number) {
+  const { Box, Text, Button } = els
+  return (
+    <Box key="threadline" flexDirection="row" justifyContent="space-between">
+      <Box key="earlier">{hidden === 0 ? null : <Text color="inactive">{`Earlier ${hidden}`}</Text>}</Box>
+      <Box key="threadactions" flexShrink={0}>
+        <Button key="openpane" label="Open in pane" dimColor onPress={() => openSidePane($)} />
+        <Text key="clearsep">{'  '}</Text>
+        <Button key="clearthread" label="Clear" dimColor onPress={() => clearThread($)} />
+      </Box>
+    </Box>
+  )
+}
+
+// The Band's Side question rows, under its two lines: a blank row, the latest Exchange once there is one,
+// the Ask box with its label (`Follow-up` after the first Exchange), and the hint before the first.
+// Mobile has no box to label or click, so it gets the blank row and its one-line notice.
+function sideRows(
   $: EngineInterface,
   els: ElementTable,
   surface: RenderSurface,
   s: Side,
-  placeholder: string,
-  isPaneFocused: boolean,
+  leaves: number,
+  rows: number,
+  columns: number,
 ) {
   const { Box, Text } = els
-  if ((surface === 'terminal' || surface === 'desktop') && 'Client' in els && els.Client !== undefined) {
-    return (
-      <els.Client
-        key={ASK_BOX}
-        module="./askbox.tsx"
-        props={{ draft: s.draft, seq: s.draftSeq, placeholder, isPaneFocused } satisfies AskBoxProps}
-        width="100%"
-      />
-    )
-  }
-  if (surface !== 'mobile' && 'Input' in els && els.Input !== undefined) {
-    return (
-      <Box key="askfield" flexDirection="column">
-        <els.Input
-          key="ask"
-          value={s.draft}
-          placeholder={placeholder}
-          submitLabel="ask"
-          autoFocus
-          onInput={(v) => updateSide($, (cur) => ({ ...cur, draft: v }))}
-          onSubmit={(v) => askSide($, v)}
-        />
-        {s.draft.trim() === '' ? null : (
-          <Box key="draftview">
-            <Text key="drafttext" dimColor wrap="wrap">
-              {s.draft}
-            </Text>
-          </Box>
-        )}
-      </Box>
-    )
-  }
+  const field = askField($, els, surface, {
+    s,
+    placeholder: placeholderOf(s),
+    isPaneFocused: true,
+    leaves,
+    isInBand: true,
+  })
+  const hasBox = hasDrawnBox(els, surface) || hasTypingField(els, surface)
+  // Mobile has no box, so a saved Thread draws nothing there.
+  const latest = hasBox ? s.turns.at(-1) : undefined
   return (
-    <Text key="ask" dimColor>
-      Type side questions in the desktop app or the terminal.
-    </Text>
+    <Box key="siderows" flexDirection="column">
+      {/* Drawn text loses its key, so each line sits in a keyed Box. */}
+      <Box key="sidegap">
+        <Text> </Text>
+      </Box>
+      {latest === undefined ? null : threadLine($, els, s.turns.length - 1)}
+      {latest === undefined ? null : sideExchange(els, latest, rows, columns)}
+      {hasBox ? (
+        <Box key="askrow" flexDirection="row">
+          <Box key="sidelabel" flexShrink={0} marginRight={1}>
+            <Text>{labelOf(s)}</Text>
+          </Box>
+          {field}
+        </Box>
+      ) : (
+        field
+      )}
+      {hasBox && latest === undefined ? (
+        <Box key="sidehint" flexDirection="row">
+          <Text key="h1" color="inactive">
+            The main agent won't see this.
+          </Text>
+          {sep(els, 'h2')}
+          <Text key="h3" color="inactive">
+            Click to type
+          </Text>
+          {sep(els, 'h4')}
+          <Text key="h5" color="inactive">
+            Enter asks
+          </Text>
+        </Box>
+      ) : null}
+    </Box>
   )
 }
 
@@ -632,17 +925,30 @@ function askField(
 // this plugin were absent, and a next() it already made is replayed, never run twice.
 
 function sessionHooks(on: On) {
+  // The band's last Keep-warm ping; a reload forgets it, which at worst allows one early ping.
+  let ping = NO_PING
   on('session.start', async ($, e, next) => {
     const out = await next(e)
     await $.tool.register(TOOL_SPEC)
     // Every TICK_MS, so the cache item's minutes count down.
     $.clock.every(TICK_MS, () => {
-      void $.clock.now().then((t) => advance($, t))
+      void $.clock.now().then(async (t) => {
+        await advance($, t)
+        if (!(await autoWarmTick($, t, ping))) return
+        ping = { at: t, isWaiting: true }
+        if (!(await sendPing($))) ping = { ...ping, isWaiting: false }
+      })
     })
     await advance($, await $.clock.now())
     await refresh($)
     return out
   })
+
+  // Any prompt but the band's own ping is the user's (or another mod's) next message: Auto warm is done.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.text !== KEEP_WARM_PROMPT && (await readAuto($)).isOn) await update($, autoWarm, () => NO_AUTO_WARM)
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // Pushed by the engine after each turn and when a rate limit moves a point.
   on('session.measure', async ($, e, next) => {
@@ -698,33 +1004,54 @@ function turnEndHooks(on: On) {
 function bandHooks(on: On) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     // Every value the band draws, read at once.
-    const [figures, open, handoffNow, compacting, seen, t] = await Promise.all([
+    const [figures, open, handoffNow, compacting, seen, auto, t, sideOpen, s, leaves] = await Promise.all([
       read($, line),
       read($, isOpen),
       read($, handoff),
       read($, isCompacting),
       read($, cache),
+      readAuto($),
       read($, now),
+      read($, isSideOpen),
+      readSide($),
+      read($, keyboardLeaves),
     ])
     if (e.props.hasSurvey || figures === null) return next(e)
 
     const els = $.ui.resolve(e)
     const { Box } = els
+    // Rows the Band uses besides the answer: its two lines, the list of Details, then the Side question's own
+    // blank row, Thread line and question, and the Ask box: its borders and the rows its draft wraps to.
+    const askBox = 2 + textRows(s.draft, Math.max(1, e.props.bodyColumns - askBoxCells(s)))
+    const otherRows = 2 + (open ? 1 + (figures.parts ?? []).length : 0) + 3 + askBox
     const b: Band = {
       figures,
       isOpen: open,
       handoff: handoffNow,
       isCompacting: compacting,
       cache: seen,
+      auto,
       t,
       surface: e.surface,
       bodyColumns: e.props.bodyColumns,
+      isSideOpen: sideOpen,
     }
     return (
       <Box flexDirection="column">
         {firstRow($, els, b)}
         {secondRow($, els, b)}
         {open ? detailsList(els, figures) : null}
+        {sideOpen
+          ? sideRows(
+              $,
+              els,
+              b.surface,
+              s,
+              leaves,
+              answerRows(e.props.maxRows, otherRows),
+              Math.max(1, e.props.bodyColumns - LABEL_CELLS),
+            )
+          : null}
       </Box>
     )
   })
@@ -734,7 +1061,8 @@ function sideHooks(on: On) {
   // The typing box's posts (askbox.tsx): each change keeps the draft, and Enter asks.
   // Its data came from code on the surface, so its shape is checked before use.
   on('ui.message', async ($, e, next) => {
-    if (e.requestId !== SIDE_PANE || e.element !== ASK_BOX) return next(e)
+    const isAskBox = e.element === ASK_BOX && (e.requestId === SIDE_PANE || e.component === 'AbovePrompt')
+    if (!isAskBox) return next(e)
     const post = e.data as Partial<AskBoxPost> | null
     if (post === null || typeof post !== 'object' || typeof post.text !== 'string') return {}
     const text = post.text
@@ -743,12 +1071,23 @@ function sideHooks(on: On) {
     return {}
   })
 
+  // The Ask box can't see the keyboard, so every move the engine reports tells it: one that lands
+  // on another site, or on something of the Band's that is not this mod's, means it left.
+  on('ui.focus', async ($, e, next) => {
+    const out = await next(e)
+    const isOwnBandElement = e.component === 'AbovePrompt' && e.plugin === 'desk-status' && e.element !== undefined
+    // Hidden, there is no Ask box to tell, and a write would redraw the Band for nothing.
+    const isMove = out.deny === undefined && !isOwnBandElement && (await read($, isSideOpen))
+    if (isMove) await update($, keyboardLeaves, (n) => n + 1)
+    return out
+  }).catch(($, e, next) => next(e))
+
   // The side-question panel: the thread and a typing box.
   on('ui.render', { component: 'Pane', requestId: SIDE_PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text } = els
     const s = await readSide($)
-    const placeholder = s.turns.length === 0 ? 'Ask about this chat…' : 'Ask a follow-up…'
+    const placeholder = placeholderOf(s)
     // The desktop app clipped the field's lower edge: the padding gives it room.
     // Docked, the panel takes its full height and the thread takes the spare rows,
     // which pins the typing box to the bottom. Inline, the frame fits the tree, so no stretch.
@@ -758,14 +1097,20 @@ function sideHooks(on: On) {
       <Box key="sidepane" flexDirection="column" alignItems="stretch" paddingBottom={1} {...fullHeight}>
         <Box key="thread" flexDirection="column" flexGrow={1}>
           {s.turns.length === 0 ? (
-            <Text key="hint" dimColor>
+            <Text key="hint" color="inactive">
               Ask about the main chat. The main agent won't see this.
             </Text>
           ) : null}
           {sideThread(els, s.turns)}
         </Box>
         <Box key="askrow" flexDirection="column" alignItems="stretch" width="100%" paddingY={1}>
-          {askField($, els, e.surface, s, placeholder, e.props.isFocused)}
+          {askField($, els, e.surface, {
+            s,
+            placeholder,
+            isPaneFocused: e.props.isFocused,
+            leaves: 0,
+            isInBand: false,
+          })}
         </Box>
       </Box>
     )

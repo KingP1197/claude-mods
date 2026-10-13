@@ -54,6 +54,13 @@ export type CacheSeen = {
   ttlMs: number | null
 }
 
+/** The Auto warm switch: while on, the band keeps the hour-long cache warm until the off time. */
+export type AutoWarm = {
+  isOn: boolean
+  /** When the switch turns itself off, in ms; 0 while it is off. */
+  offAt: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'desk-status': {
@@ -65,8 +72,14 @@ declare module 'claude-code' {
       /** True from a Compact press until the compaction ends or is refused. */
       isCompacting: boolean
       side: Side
+      /** True while the Band shows the Ask box under its two lines. */
+      isSideOpen: boolean
+      /** How many times the keyboard has moved out of the Band; the Ask box ends typing on each. */
+      keyboardLeaves: number
       /** Null until the main thread's first reply. */
       cache: CacheSeen | null
+      /** The Auto warm switch; an older save lacks it, which reads as off. */
+      autoWarm: AutoWarm
     }
   }
 }

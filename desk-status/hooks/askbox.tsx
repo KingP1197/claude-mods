@@ -8,13 +8,24 @@ export type AskBoxProps = {
   draft: string
   seq: number
   placeholder: string
-  /** Whether the panel holds the keyboard: the one sign the box gets that it lost it. */
+  /** Whether the panel holds the keyboard: the one sign the box gets that it lost it. The Band passes true. */
   isPaneFocused: boolean
+  /** Whether the box draws its own `Click the box to type.` line; the Band's hint carries that. */
+  hasClickLine: boolean
+  /** Moves of the keyboard out of the Band so far; each ends typing. The panel passes 0. */
+  leaves: number
 }
 export type AskBoxPost = { kind: 'draft' | 'ask'; text: string }
 
 // Changed in place by the handlers and the blink timer, which outlive the call that made them.
-type Live = { text: string; seq: number; isActive: boolean; wasPaneFocused: boolean; isCursorOn: boolean }
+type Live = {
+  text: string
+  seq: number
+  leaves: number
+  isActive: boolean
+  wasPaneFocused: boolean
+  isCursorOn: boolean
+}
 type Local = { live: Live }
 
 export const BLINK_MS = 530
@@ -70,6 +81,7 @@ function liveOf(props: AskBoxProps, surface: Surface): Live {
   const made: Live = {
     text: props.draft,
     seq: props.seq,
+    leaves: props.leaves,
     isActive: false,
     wasPaneFocused: props.isPaneFocused,
     isCursorOn: true,
@@ -94,6 +106,11 @@ function sync(m: Live, props: AskBoxProps) {
   // No event says the box lost the keyboard, but the panel losing it does.
   if (m.wasPaneFocused && !props.isPaneFocused) m.isActive = false
   m.wasPaneFocused = props.isPaneFocused
+  // The Band says so when the keyboard leaves it.
+  if (m.leaves !== props.leaves) {
+    m.leaves = props.leaves
+    m.isActive = false
+  }
 }
 
 // A click or a key starts typing mode; each key edits the text or asks.
@@ -138,7 +155,7 @@ function view(m: Live, props: AskBoxProps, surface: Surface) {
           </Text>
         )}
       </Box>
-      {m.isActive ? null : <Text dimColor>Click the box to type.</Text>}
+      {m.isActive || !props.hasClickLine ? null : <Text dimColor>Click the box to type.</Text>}
     </Box>
   )
 }

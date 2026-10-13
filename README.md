@@ -3,7 +3,7 @@
 Two mods for [Claude Code](https://claude.com/claude-code).
 
 - **desk-status** adds a band above the prompt. It shows your branch, your rate limits and a bar of how full the context window is, split by source. A Details list breaks the bar down. Buttons write a handoff note to your clipboard, compact the session, or ask a side question.
-- **agent-board** opens a side panel with one card per subagent. Each card shows the agent's effort tier, model, to-do progress, share of the context window, tokens and running time. Click a card's name to see the agent's last three messages, send it a message, or stop it. The panel opens by itself when a batch of agents starts. `/agent-board` reopens it.
+- **agent-board** opens a side panel with one card per subagent. Each card shows the agent's type, effort level, model, to-do progress, share of the context window, tokens and running time. Click a card's name to see the agent's last three messages, send it a message, or stop it. The panel opens by itself when a batch of agents starts. `/agent-board` reopens it.
 
 ## Install
 

@@ -1,16 +1,26 @@
 // The cache item: is the main thread's prompt cache still alive, and what a lapse costs.
 // Nothing here calls the engine: the validator follows `$` only within one file, so the hooks live in register.tsx.
-import type { CacheSeen } from '../types'
+import type { AutoWarm, CacheSeen } from '../types'
 
 export const FIVE_MIN = 5 * 60_000
 export const ONE_HOUR = 60 * 60_000
 // Used until the transcript names the lifetime. The shorter one, so the item never claims warm past a lapse.
 const DEFAULT_TTL = FIVE_MIN
 export const TICK_MS = 30_000
+/** How long Auto warm stays on once pressed. */
+export const AUTO_WARM_SPAN = 3 * 60 * 60_000
+/** What the band's cache item adds while Auto warm is on, after a separator like the band's others. */
+export const AUTO_MARK = 'auto'
+/** The text of the Keep-warm ping. The band tells its own ping from the user's prompt by this text. */
+export const KEEP_WARM_PROMPT = 'Keep-warm ping from desk-status Auto warm. Reply with only: ok'
+/** Auto warm pings once the hour-long cache has this many minutes or fewer left. */
+export const PING_MARGIN_MIN = 10
+/** No second ping this soon after the last one, so two ticks never ping twice. */
+export const PING_GAP = 60_000
+export const NO_AUTO_WARM: AutoWarm = { isOn: false, offAt: 0 }
 
-export const WARM_COLOR = '#ff9e64'
-
-export const KEEP_WARM_PROMPT = 'Keep-warm ping from the desk-status cache button. Reply with only: ok'
+/** Saved state outlives a reload: fills in a field a half-written save left out, so a missing off time cannot keep the switch on. */
+export const autoWarmOf = (saved: AutoWarm): AutoWarm => ({ ...NO_AUTO_WARM, ...saved })
 
 // The turn's usage carries no lifetime; the transcript records each write split by it.
 // Its tail holds the last writes; a whole read would hit the 4 MiB limit on a long session.
