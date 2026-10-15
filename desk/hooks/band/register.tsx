@@ -76,9 +76,8 @@ const cache = atom({ plugin: 'desk', key: 'cache' } as const, null as CacheSeen 
 const autoWarm = atom({ plugin: 'desk', key: 'autoWarm' } as const, NO_AUTO_WARM)
 // The board's Batch, which the Agent counter reads and never writes. The board declares the same key.
 const agents = atom({ plugin: 'desk', key: 'agents' } as const, [] as AgentRow[])
-// The tracer's own saved flags, which the Tracer button clears. The tracer declares the same two keys. They stay literals: the engine's scan refuses an atom key imported from another file. shared.test.ts proves the keys agree.
+// The tracer's own saved flag, which the Tracer button clears. The tracer declares the same key. It stays a literal: the engine's scan refuses an atom key imported from another file. shared.test.ts proves the keys agree.
 const tracerClosed = atom({ plugin: 'desk', key: 'closed' } as const, false)
-const tracerMinimized = atom({ plugin: 'desk', key: 'minimized' } as const, false)
 
 // One color per source, biggest first. Readable on dark and light.
 // Neighbors sit far apart in hue, so the two biggest sources (side by side in the bar) never look alike.
@@ -223,18 +222,17 @@ async function startHandoff($: EngineInterface, surface: RenderSurface) {
   void $.prompt.submit({ text: HANDOFF_PROMPT }).then((r) => (r.drop === undefined ? undefined : cancel()), cancel)
 }
 
-// The Tracer button's press: bring the tracer's pane back full-size with the keyboard, as a press on a Trail row does.
+// The Tracer button's press: bring the tracer's pane back with the keyboard, as a press on a Trail row does.
 // A pane the engine rejects is left as it is, and the toast says why.
 async function openTracer($: EngineInterface) {
   await update($, tracerClosed, () => false)
-  await update($, tracerMinimized, () => false)
   await $.ui.open({ id: TRACER_PANE, title: TRACER_TITLE, focus: true }).catch((err: unknown) => {
     $.ui.toast(`Could not open ${TRACER_TITLE}: ${why(err)}`)
   })
 }
 
 // The Agent counter's press: open the board's pane with the keyboard, as the board's own `/agent-board` does.
-// The board keeps no closed or minimized flag, so there is no state to reset. A pane the engine rejects is left as it is, and the toast says why.
+// The board keeps no closed flag, so there is no state to reset. A pane the engine rejects is left as it is, and the toast says why.
 async function openBoard($: EngineInterface) {
   await $.ui.open({ id: BOARD_PANE, title: BOARD_PANE_TITLE, focus: true }).catch((err: unknown) => {
     $.ui.toast(`Could not open ${BOARD_PANE_TITLE}: ${why(err)}`)

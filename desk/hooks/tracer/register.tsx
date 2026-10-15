@@ -38,7 +38,6 @@ import { parentOf, reveal, systemOf } from './reveal'
 import { parseStatus } from './status'
 import { drawnChars, hunksOf, named, viewOfChange, viewOfRead, type FileView } from './view'
 import { mayBeInUnlistedWorktree, parseWorktrees } from './worktrees'
-import { stripOf } from './strip'
 import { changedOf, summaryOf, type Summary } from './summary'
 import { COMMAND, PANE, TITLE, clearRecent, fold, isUserClose, tagWords, withDefaults, type Touch } from './record'
 import {
@@ -158,9 +157,6 @@ const attached = atom({ plugin: 'desk', key: 'attached' } as const, [] as string
 
 // What the person changed in files from the pane since their last message, oldest first.
 const notes = atom({ plugin: 'desk', key: 'notes' } as const, [] as EditNote[])
-
-// Whether the person minimized the pane to its strip.
-const minimized = atom({ plugin: 'desk', key: 'minimized' } as const, false)
 
 // The Descriptions written so far, each by the key of the file and content it describes.
 const descriptions = atom({ plugin: 'desk', key: 'descriptions' } as const, [] as Array<{ key: string; text: string }>)
@@ -285,10 +281,6 @@ async function relistWorktreesFor($: EngineInterface, touches: Touch[]) {
 const clickGroup = ($: EngineInterface, name: string) =>
   update($, closedGroups, (c) => (c.includes(name) ? c.filter((g) => g !== name) : [...c, name]))
 
-/** The addresses of the Minimize button on the full pane and the Restore button on the strip. */
-const MINIMIZE_KEY = 'minimize'
-const RESTORE_KEY = 'restore'
-
 /** The address of the toggle that shows every touched file or only the changed ones. */
 const CHANGED_ONLY_KEY = 'changed-only'
 
@@ -305,14 +297,13 @@ const CLAUDE_ONLY_KEY = 'claude-only'
 /** Flips the Trail between `Show Claude only` and `Show all`. */
 const toggleClaudeOnly = ($: EngineInterface) => update($, isClaudeOnly, (c) => c !== true)
 
-/** A press on a Touch in the Trail: its file is selected in the Files pane, the Files pane is opened with the keyboard if it was closed or minimized, and the Touch is the Trail's selected one. The terminal opens the File view on the file; the App form runs the Open rule on its current path instead. */
+/** A press on a Touch in the Trail: its file is selected in the Files pane, the Files pane is opened with the keyboard if it was closed, and the Touch is the Trail's selected one. The terminal opens the File view on the file; the App form runs the Open rule on its current path instead. */
 async function pressTouch($: EngineInterface, t: TouchEntry, isApp: boolean) {
   const path = currentPath(await readLog($), t)
   if (isApp) await Promise.all([selectFile($, path), update($, filesNotice, () => null)])
   else await clickFile($, path)
   await update($, trailSelected, () => t.n)
   await update($, closed, () => false)
-  await update($, minimized, () => false)
   await $.ui.open({ id: PANE, title: TITLE, focus: true }).catch(() => null)
   if (isApp) await openRule($, path)
 }
@@ -520,24 +511,8 @@ async function jumpToLine($: EngineInterface, n: number) {
   await update($, isActing, () => true)
 }
 
-/** The body rows the strip asks the engine for: the files, and room for the Restore button. */
-const STRIP_ROWS = 2
-
-/**
- * Opens the pane, at the strip's size while it is minimized and at the default size otherwise. Every open sets the
- * size anew, so every open of the pane says which it wants. The size is a request, not a grant: the engine reads
- * `rows` only for a pane seated inline above the prompt and ignores it in the dock, and keeps a size the person
- * dragged. UNVERIFIED in the app: whether the pane shrinks, or only its content changes to the strip.
- */
-const openPane = ($: EngineInterface, isMinimized: boolean) =>
-  $.ui.open(isMinimized ? { id: PANE, title: TITLE, rows: STRIP_ROWS } : { id: PANE, title: TITLE })
-
-/** Shrinks the pane to its strip, or brings the full pane back. */
-async function setMinimized($: EngineInterface, value: boolean) {
-  await update($, minimized, () => value)
-  // The resize is cosmetic: where the engine refuses it, the strip still draws.
-  await openPane($, value).catch(() => null)
-}
+/** Opens the pane at the default size; the engine keeps a size the person dragged. */
+const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: TITLE })
 
 /** The text a record last held of its file, or null where it holds none. */
 const textBefore = (e: RecordEntry | undefined): string | null => e?.lastSeen ?? e?.baseline ?? null
@@ -604,7 +579,7 @@ async function recordAll(
     ...(t.oldPath === undefined ? {} : { oldPath: t.oldPath }),
   }))
   await appendToLog($, [...ran, ...made])
-  if (isFirst && !(await read($, closed))) await openPane($, (await read($, minimized)) === true)
+  if (isFirst && !(await read($, closed))) await openPane($)
 }
 
 /** Records the user's saved edit of a file: the file's record takes the Tag `Edited by you` and the new text, and the log gains a Touch made by the user with the lines it added and removed. */
@@ -643,8 +618,6 @@ const buttonActions = ($: EngineInterface): Record<string, () => Promise<unknown
   [CANCEL_KEY]: () => closeBox($),
   [DISCARD_KEY]: () => discardComments($),
   [BACK_KEY]: () => closeFile($),
-  [MINIMIZE_KEY]: () => setMinimized($, true),
-  [RESTORE_KEY]: () => setMinimized($, false),
 })
 
 /** Runs the action of the row button a first click on the unfocused pane landed on, as its onPress would. */
@@ -913,7 +886,7 @@ function sessionHooks(on: On) {
       return { text: 'Trail opened.' }
     }
     await update($, closed, () => false)
-    await openPane($, (await read($, minimized)) === true)
+    await openPane($)
     return { text: 'File tracer opened.' }
   })
 }
@@ -1208,13 +1181,11 @@ const lookOf = async ($: EngineInterface, surface: string, columns: number): Pro
 
 /**
  * The letters that press the panes' buttons in the terminal, each its own so that no two buttons drawn at once share
- * one. Minimize and Restore share `m`: only one of them is ever drawn.
+ * one.
  */
 const HOTKEY = {
   changedOnly: 'c',
   trail: 't',
-  minimize: 'm',
-  restore: 'm',
   back: 'b',
   whole: 'w',
   acting: 'a',
@@ -1759,49 +1730,7 @@ function changesSection(
   ]
 }
 
-/** The cells the Restore button and the gap before it take from the strip's width; the app draws a button wider than its label. */
-const RESTORE_CELLS = 12
-
-/** The strip: the latest files with their Tags and dots, then "+N more", and the button that brings the full pane back. */
-function stripView($: EngineInterface, els: ElementTable, look: Look, touched: Record<string, RecordEntry>) {
-  const { Box, Text, Button } = els
-  const { entries, more } = stripOf(touched, look.columns - RESTORE_CELLS)
-  // The colour sits on Text beside the Button, never inside it: the desktop app drops colour inside a Button.
-  const listed = entries.flatMap((e, i) => {
-    const file = (
-      <Text key={`file:${i}`} color={COLOR[e.tag] ?? GREY}>
-        {`${e.name} ${tagWords(e)}${e.isRecent ? ' ●' : ''}`}
-      </Text>
-    )
-    return i === 0
-      ? [file]
-      : [
-          <Text key={`sep:${i}`} color={GREY}>
-            {' | '}
-          </Text>,
-          file,
-        ]
-  })
-  return (
-    <Box key="pane" flexDirection="row" gap={1}>
-      <Box key="strip-files">
-        <Text wrap="truncate-end">
-          {listed}
-          {more === 0 ? null : (
-            <Text key="more" color={GREY}>
-              {` | +${more} more`}
-            </Text>
-          )}
-        </Text>
-      </Box>
-      <Button key={RESTORE_KEY} {...hotkeyOf(look, 'restore')} onPress={() => setMinimized($, false)}>
-        Restore
-      </Button>
-    </Box>
-  )
-}
-
-/** The top row: the counts at the near end, the toggle, the Trail button and the Minimize button at the far end; where they do not fit side by side the buttons drop to a row of their own, whole, instead of the terminal breaking them letter by letter. The toggle names what it will do next, and waits for the first file. */
+/** The top row: the counts at the near end, the toggle and the Trail button at the far end; where they do not fit side by side the buttons drop to a row of their own, whole, instead of the terminal breaking them letter by letter. The toggle names what it will do next, and waits for the first file. */
 function barBox(
   $: EngineInterface,
   els: ElementTable,
@@ -1821,9 +1750,6 @@ function barBox(
         )}
         <Button key={TRAIL_KEY} {...hotkeyOf(look, 'trail')} onPress={() => openTrail($)}>
           Trail
-        </Button>
-        <Button key={MINIMIZE_KEY} {...hotkeyOf(look, 'minimize')} onPress={() => setMinimized($, true)}>
-          Minimize
         </Button>
       </Box>
     </Box>
@@ -2084,7 +2010,6 @@ function paneHooks(on: On) {
     const home = (await $.env.get('HOME')) ?? null
     const look = await lookOf($, e.surface, e.props.bodyColumns)
     const { isApp } = look
-    if ((await read($, minimized)) === true) return stripView($, els, look, touched)
     const isOnlyChanged = (await read($, isChangedOnly)) === true
     const canReveal = e.surface !== 'mobile'
     const isOpened =

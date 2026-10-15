@@ -79,10 +79,7 @@ export function middleCut(text: string, room: number): string {
   return `${text.slice(0, keep - end)}…${text.slice(text.length - end)}`
 }
 
-/**
- * The cells the desktop app draws around a Button's label beyond the label itself. The strip's Restore button
- * (RESTORE_CELLS in register.tsx) is a 7-letter label plus a 1-cell gap plus this.
- */
+/** The cells the desktop app draws around a Button's label beyond the label itself. */
 const BUTTON_CHROME = 2
 
 /** The fewest characters a cut name gets, however narrow the pane. A name given more than the row has left spills out of its column, so this is small. */

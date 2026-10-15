@@ -338,8 +338,6 @@ declare module 'claude-code' {
       attached: string[]
       /** What the person changed in files from the pane since their last message, oldest first. The next prompt the user writes carries them as a note each, then none is left. Several edits to one line are one note. Absent, or anything but a list, reads as none; entries of any other shape are left out. */
       notes: EditNote[]
-      /** True while the person has the pane minimized to its strip; false or absent shows the full pane. */
-      minimized: boolean
       /** The older piece of the Touch log: Touches in session order, newest last. The log is this then `logTail`, read as the newest 2,000 entries. Absent in a state from the first version. */
       log: LogEntry[]
       /** The newest entries of the Touch log, until there are enough to move into `log`; the Touch log is `log` then `logTail`. Absent in a state from before the split, which reads as none. */
