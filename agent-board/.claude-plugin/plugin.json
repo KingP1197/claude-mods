@@ -1,6 +1,0 @@
-{
-  "name": "agent-board",
-  "version": "0.1.0",
-  "description": "A side panel with one card per subagent: effort tier, model, to-do progress, context share, tokens and time. Opens by itself when a batch of agents starts; /agent-board reopens it.",
-  "types": "./types/index.d.ts"
-}

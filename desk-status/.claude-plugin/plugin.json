@@ -1,6 +1,0 @@
-{
-  "name": "desk-status",
-  "version": "0.5.0",
-  "description": "Status rows above the prompt: branch and rate limits, a context bar by source with a Details list, and a Handoff button that copies a capped handoff to the clipboard.",
-  "types": "./types/index.d.ts"
-}

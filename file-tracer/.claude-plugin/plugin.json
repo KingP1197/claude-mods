@@ -1,6 +1,0 @@
-{
-  "name": "file-tracer",
-  "version": "0.1.0",
-  "description": "A pane that lists the files Claude touched, under their folders, each marked with a color and a Tag. Opens by itself when Claude reads a file.",
-  "types": "./types/index.d.ts"
-}

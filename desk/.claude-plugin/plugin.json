@@ -1,0 +1,9 @@
+{
+  "name": "desk",
+  "version": "0.1.0",
+  "description": "The user's desk: a band above the prompt with status rows and buttons, an agent board pane with one card per subagent, and a file tracer pane listing the files Claude touched.",
+  "author": {
+    "name": "Leander"
+  },
+  "types": "./types/index.d.ts"
+}
