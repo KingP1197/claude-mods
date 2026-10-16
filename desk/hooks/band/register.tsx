@@ -8,8 +8,8 @@
 // Row 3: context bar split by source, and a Show details button.
 // On desktop the bar is an SVG whose pieces show a tooltip on hover.
 // Colors: plain text under 50% (low usage is not news), warning under 80%, error above.
-// Every hook lives in this file except the five on events other areas share (session.start, prompt.submit,
-// session.measure, turn.step, turn.complete): this file exports their handlers, and ../register.tsx registers them.
+// Every hook lives in this file, the five on events other areas share (session.start, prompt.submit, session.measure,
+// turn.step, turn.complete) too: `register` here adds them all, and the entry file ../register.tsx only calls it.
 import { atom, read, update } from 'claude-code'
 import type {
   Chunk,
@@ -23,44 +23,56 @@ import type {
   SessionUsage,
 } from 'claude-code'
 
-import type { EventIn, EventOut, PlainNext, StreamingNext } from '../handler'
+import {
+  isOwnPress,
+  takenByPressHook,
+  type EventIn,
+  type EventOut,
+  type PlainNext,
+  type StreamingNext,
+} from '../handler'
+import { REFUSED_BY_HOOK, because, errorText, failToast } from '../failures'
+import { buttonPad, inputOf, isAppAttached, svgOf } from '../surface'
 import type { AgentRow, AutoWarm, CacheSeen, Handoff, Line, Part, Side, SideTurn } from '../../types'
 import {
   AUTO_MARK,
-  AUTO_WARM_SPAN,
-  FIVE_MIN,
   KEEP_WARM_PROMPT,
   NO_AUTO_WARM,
-  ONE_HOUR,
-  PING_GAP,
-  PING_MARGIN_MIN,
+  NO_PING,
   TICK_MS,
   TTL_SCRIPT,
+  type Ping,
   autoWarmOf,
+  cacheAfterReply,
   cacheView,
   eastern,
   prefixOf,
+  pressOn,
+  promptEndsAutoWarm,
+  tickAction,
   ttlFrom,
 } from './cache'
 import { PANE as BOARD_PANE, TITLE as BOARD_PANE_TITLE } from '../board/agents'
 import { PANE as TRACER_PANE, TITLE as TRACER_TITLE } from '../tracer/record'
 import { agentsCard, countAgents } from './agents'
+import { BAND_DOING, bandButtonOf, type BandButton } from './keys'
+import { COMPACT, HANDOFF, SIDE, claim } from './busy'
 import { COMPACT_PROMPT } from './compact'
 import {
-  agentsStart,
   answerRows,
-  cacheStart,
-  cardFits,
+  cardLeft,
   cutAnswer,
   cutQuestion,
-  fit,
+  type Figures,
+  type RowItem,
+  type RowKey,
   SEP_TEXT,
+  statsItems,
+  type StatsItems,
   textRows,
-  type Shown,
-  type Widths,
 } from './fit'
 import type { AskBoxPost, AskBoxProps } from './askbox'
-import { ASK_BOX, NO_SIDE, SIDE_PANE, forkFailure, sideOf, sidePrompt } from './side'
+import { ASK_BOX, NO_SIDE, SIDE_PANE, forkFailure, forkThrew, sidePrompt } from './side'
 import { CAP, FIRST_LINE, HANDOFF_PROMPT, IDLE, TOOL, TOOL_SPEC, estimateTokens, fail, ok, textOf } from './handoff'
 
 // The validator reads state only through atoms declared in this file.
@@ -205,21 +217,42 @@ function advance($: EngineInterface, t: number) {
   return update($, now, (n) => Math.max(n, t))
 }
 
-// The Handoff button's press: queue the request, or reset one that never finished.
+// The Handoff button's press: queue the request; or, on a request already out, free the button and end its turn if it runs.
 async function startHandoff($: EngineInterface, surface: RenderSurface) {
-  // Claimed inside one update, so two presses at once cannot both queue a request.
-  const after = await update($, handoff, (h): Handoff => (h.phase === 'idle' ? { phase: 'queued', surface } : IDLE))
-  if (after.phase === 'idle') {
-    $.ui.toast('Handoff reset. Press Write handoff again to write a new one.')
-    return
+  // Claimed inside one update, so two presses at once cannot both queue a request. A refused claim frees the button.
+  const press = claim(HANDOFF, surface)
+  await update($, handoff, press.change)
+  if (press.isTaken()) return sendHandoff($)
+  const was = press.seen()
+  if (was?.phase === 'writing' && was.turnId !== undefined) return stopHandoff($, was.turnId)
+  $.ui.toast('Handoff reset. Press Write handoff again to write a new one.')
+}
+
+// A second press while the handoff turn runs: end that turn. The button is already free, so the turn's end says nothing.
+async function stopHandoff($: EngineInterface, turnId: string) {
+  try {
+    await $.turn.abort({ turnId })
+    $.ui.toast('Handoff stopped.')
+  } catch (err) {
+    $.ui.toast(`Could not stop the handoff ${because(errorText(err))}. The button is free again.`)
   }
-  const cancel = async () => {
-    await update($, handoff, () => IDLE)
-    $.ui.toast('The handoff request could not be sent.')
+}
+
+// Why a hook refused a prompt: the text it gave, or a plain line where it gave none.
+const dropReason = (drop: string) => drop || REFUSED_BY_HOOK
+
+// Sends the handoff request for a press that queued one.
+function sendHandoff($: EngineInterface) {
+  const cancel = async (reason: string) => {
+    await update($, handoff, HANDOFF.release)
+    $.ui.toast(`The handoff request could not be sent ${because(reason)}.`)
   }
   // Resolves when the handoff turn starts, which may wait for a running turn; the press does not wait for it.
   // A hook that refuses the prompt answers { drop } rather than failing the call.
-  void $.prompt.submit({ text: HANDOFF_PROMPT }).then((r) => (r.drop === undefined ? undefined : cancel()), cancel)
+  void $.prompt.submit({ text: HANDOFF_PROMPT }).then(
+    (r) => (r.drop === undefined ? undefined : cancel(dropReason(r.drop))),
+    (err: unknown) => cancel(errorText(err)),
+  )
 }
 
 // The Tracer button's press: bring the tracer's pane back with the keyboard, as a press on a Trail row does.
@@ -227,7 +260,7 @@ async function startHandoff($: EngineInterface, surface: RenderSurface) {
 async function openTracer($: EngineInterface) {
   await update($, tracerClosed, () => false)
   await $.ui.open({ id: TRACER_PANE, title: TRACER_TITLE, focus: true }).catch((err: unknown) => {
-    $.ui.toast(`Could not open ${TRACER_TITLE}: ${why(err)}`)
+    $.ui.toast(`Could not open ${TRACER_TITLE}: ${errorText(err)}`)
   })
 }
 
@@ -235,29 +268,24 @@ async function openTracer($: EngineInterface) {
 // The board keeps no closed flag, so there is no state to reset. A pane the engine rejects is left as it is, and the toast says why.
 async function openBoard($: EngineInterface) {
   await $.ui.open({ id: BOARD_PANE, title: BOARD_PANE_TITLE, focus: true }).catch((err: unknown) => {
-    $.ui.toast(`Could not open ${BOARD_PANE_TITLE}: ${why(err)}`)
+    $.ui.toast(`Could not open ${BOARD_PANE_TITLE}: ${errorText(err)}`)
   })
 }
-
-const why = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
 // The Compact button's press: run `/compact <instructions>` as if the user typed it.
 // Not $.session.compact: the desktop app runs the session headless, where that call is refused.
 // The engine queues the command until the session is idle; its result shows in the transcript.
 async function startCompact($: EngineInterface) {
-  // Claimed inside one update, so two presses at once run one command. Set on every run of the change, so a retry decides afresh.
-  let isClaimed = false
-  await update($, isCompacting, (isBusy) => {
-    isClaimed = !isBusy
-    return true
-  })
-  if (!isClaimed) return
+  // Claimed inside one update, so two presses at once run one command.
+  const press = claim(COMPACT)
+  await update($, isCompacting, press.change)
+  if (!press.isTaken()) return
   try {
     await $.command.run({ command: 'compact', args: COMPACT_PROMPT })
   } catch (err) {
-    $.ui.toast(`Could not compact (${why(err)}).`)
+    $.ui.toast(`Could not compact ${because(errorText(err))}.`)
   } finally {
-    await update($, isCompacting, () => false)
+    await update($, isCompacting, COMPACT.release)
   }
 }
 
@@ -284,15 +312,13 @@ async function pressAutoWarm($: EngineInterface): Promise<AutoWarm | null> {
     await update($, autoWarm, () => NO_AUTO_WARM)
     return NO_AUTO_WARM
   }
-  const c = await read($, cache)
-  if (c?.ttlMs !== ONE_HOUR) {
-    $.ui.toast('Auto warm needs the hour-long cache. Yours lasts 5 minutes now.')
+  const press = pressOn(await read($, cache), await $.clock.now())
+  if (!press.isOk) {
+    $.ui.toast(press.toast)
     return null
   }
-  const t = await $.clock.now()
-  const on: AutoWarm = { isOn: true, offAt: t + AUTO_WARM_SPAN }
-  await update($, autoWarm, () => on)
-  return on
+  await update($, autoWarm, () => press.auto)
+  return press.auto
 }
 
 // The terminal's button: the same press as the card's switch, then a toast, since the card's line is not on screen there.
@@ -308,52 +334,48 @@ function sendPing($: EngineInterface): Promise<boolean> {
   return $.prompt.submit({ text: KEEP_WARM_PROMPT }).then(
     (r) => {
       if (r.drop === undefined) return true
-      $.ui.toast('The keep-warm message was refused.')
+      $.ui.toast(`The keep-warm message was refused ${because(dropReason(r.drop))}.`)
       return false
     },
-    () => {
-      $.ui.toast('The keep-warm message could not be sent.')
+    (err: unknown) => {
+      $.ui.toast(`The keep-warm message could not be sent ${because(errorText(err))}.`)
       return false
     },
   )
 }
 
-/** The band's last Keep-warm ping: when it went, and whether it still waits for its answer. */
-type Ping = { at: number; isWaiting: boolean }
-const NO_PING: Ping = { at: Number.NEGATIVE_INFINITY, isWaiting: false }
-
-// Each tick, while Auto warm is on: ping once the hour-long cache has ten minutes or fewer left. True comes back when
-// this tick should ping. A ping that waits (queued behind a long tool call, say) holds the next until its reply
-// restarts the cache's clock: a request sent after the ping is that reply.
+// Each tick: the rules in cache.ts say whether Auto warm stays, switches off or pings. True comes back when this tick
+// should ping. A ping that waits (queued behind a long tool call, say) holds the next until its reply restarts the
+// cache's clock.
 async function autoWarmTick($: EngineInterface, t: number, ping: Ping): Promise<boolean> {
-  const auto = await readAuto($)
-  if (!auto.isOn) return false
-  const c = await read($, cache)
-  // Off for good: the off time has passed, or the cache now lasts five minutes, which a ten-minute margin cannot cover.
-  if (t >= auto.offAt || c?.ttlMs === FIVE_MIN) {
-    await update($, autoWarm, () => NO_AUTO_WARM)
-    return false
-  }
-  return isPingDue(c, t, ping)
+  const action = tickAction(await readAuto($), await read($, cache), t, ping)
+  if (action.kind === 'off') await update($, autoWarm, () => NO_AUTO_WARM)
+  return action.kind === 'ping'
 }
 
-// Whether the cache is at the point to ping: hour-long and warm with ten minutes or fewer left, the guard passed,
-// and the last ping answered (the cache's last request came after it) or never sent.
-function isPingDue(c: CacheSeen | null, t: number, ping: Ping): boolean {
-  if (c === null || c.ttlMs !== ONE_HOUR || t - ping.at < PING_GAP) return false
-  if (ping.isWaiting && c.sentAt < ping.at) return false
-  const view = cacheView(c, t)
-  return view.state === 'warm' && view.minutesLeft <= PING_MARGIN_MIN
+// The Details button's press: opens the details, or closes them. Whether they are open is read now, not when the button was drawn.
+async function toggleDetails($: EngineInterface) {
+  let isOpening = false
+  await update($, isOpen, (open) => {
+    isOpening = !open
+    return isOpening
+  })
+  if (isOpening) await refresh($)
 }
 
-// Saved state outlives a reload, so a value an older version saved can lack newer fields or hold old turns.
-// Every read and write of the side panel's state goes through these two, which bring it up to date.
-async function readSide($: EngineInterface): Promise<Side> {
-  return sideOf(await read($, side))
-}
-function updateSide($: EngineInterface, fn: (s: Side) => Side) {
-  return update($, side, (s) => fn(sideOf(s)))
-}
+// The action of each band Button: the one copy, which the band's `ui.press` hook runs. `surface` is where the press came from.
+const bandActions = ($: EngineInterface, surface: RenderSurface): Record<BandButton, () => Promise<unknown>> => ({
+  tracer: () => openTracer($),
+  side: () => toggleSide($),
+  compact: () => startCompact($),
+  handoff: () => startHandoff($, surface),
+  agents: () => openBoard($),
+  details: () => toggleDetails($),
+  openpane: () => openSidePane($),
+  clearthread: () => clearThread($),
+  autowarm: () => pressAutoWarm($),
+  cstate: () => pressAutoWarmButton($),
+})
 
 // The Side question button's press: show or fold the Ask box under the Band's two lines.
 async function toggleSide($: EngineInterface) {
@@ -361,14 +383,19 @@ async function toggleSide($: EngineInterface) {
 }
 
 // Open in pane: the existing Side questions pane, which draws the whole Thread.
+// A pane the engine rejects, or does not place, is left as it is, and the toast says why.
 async function openSidePane($: EngineInterface) {
-  const r = await $.ui.open({ id: SIDE_PANE, title: 'Side questions', focus: true })
-  if (!r.isPlaced) $.ui.toast(`Could not open the side panel (${r.reason}).`)
+  try {
+    const r = await $.ui.open({ id: SIDE_PANE, title: 'Side questions', focus: true })
+    if (!r.isPlaced) $.ui.toast(`Could not open the side panel ${because(errorText(r.reason))}.`)
+  } catch (err) {
+    $.ui.toast(`Could not open the side panel ${because(errorText(err))}.`)
+  }
 }
 
 // Clear: empties the Thread. No confirmation: it holds side questions only, and the main chat is untouched.
 async function clearThread($: EngineInterface) {
-  await updateSide($, (s) => ({ ...s, turns: [] }))
+  await update($, side, (s) => ({ ...s, turns: [] }))
 }
 
 // Enter in the panel: one tool-less request over a copy of the main chat, earlier side turns included.
@@ -376,29 +403,16 @@ async function clearThread($: EngineInterface) {
 async function askSide($: EngineInterface, text: string) {
   const question = text.trim()
   if (question === '') return
-  // Claimed inside one update, so two asks at once send one fork. `at` and `earlier` come from the same
-  // state the claim saw; both are set on every run of the change, so a retry decides afresh.
-  let at = -1
-  let earlier: SideTurn[] = []
-  await updateSide($, (s) => {
-    if (s.isAsking) {
-      at = -1
-      return s
-    }
-    at = s.turns.length
-    earlier = s.turns
-    return {
-      ...s,
-      draft: '',
-      draftSeq: s.draftSeq + 1,
-      isAsking: true,
-      turns: [...s.turns, { question, state: 'pending' }],
-    }
-  })
-  if (at < 0) {
+  // Claimed inside one update, so two asks at once send one fork. The question went in last, so the turns
+  // before it are the ones the claim saw.
+  const ask = claim(SIDE, question)
+  const after = await update($, side, ask.change)
+  if (!ask.isTaken()) {
     $.ui.toast('Still busy with the last side question.')
     return
   }
+  const at = after.turns.length - 1
+  const earlier = after.turns.slice(0, at)
   let settled: SideTurn
   try {
     const r = await $.model.fork({ prompt: sidePrompt(earlier, question) })
@@ -406,11 +420,10 @@ async function askSide($: EngineInterface, text: string) {
       ? { question, state: 'answered', answer: r.text }
       : { question, state: 'failed', failure: forkFailure(r) }
   } catch (err) {
-    settled = { question, state: 'failed', failure: `No answer (${why(err)}).` }
+    settled = { question, state: 'failed', failure: forkThrew(err) }
   }
-  await updateSide($, (s) => ({
-    ...s,
-    isAsking: false,
+  await update($, side, (s) => ({
+    ...SIDE.release(s),
     turns: s.turns.map((t, i) => (i === at ? settled : t)),
   }))
 }
@@ -419,18 +432,26 @@ async function askSide($: EngineInterface, text: string) {
 async function noteCache($: EngineInterface, sentAt: number, usage: ModelUsage) {
   try {
     const prefix = prefixOf(usage)
-    await update($, cache, (c) => ({ sentAt, prefix, ttlMs: c?.ttlMs ?? null }))
+    await update($, cache, (c) => cacheAfterReply(c, sentAt, prefix))
     await advance($, sentAt)
   } catch {
     // The item keeps its last reading.
   }
 }
 
+// Why a handoff turn ended without a copy, by how the turn ended.
+const TURN_ENDED: Record<EventIn<'turn.complete'>['reason'], string> = {
+  answer: 'the turn ended without calling save_handoff',
+  aborted: 'the turn was stopped',
+  refusal: 'the model refused the request',
+  error: 'the turn ended on an error',
+}
+
 // The handoff turn ended without a copy: free the button and say so.
-async function handoffTurnEnded($: EngineInterface) {
+async function handoffTurnEnded($: EngineInterface, reason: EventIn<'turn.complete'>['reason']) {
   if ((await read($, handoff)).phase !== 'writing') return
-  await update($, handoff, () => IDLE)
-  $.ui.toast('The handoff was not copied. Press Write handoff to try again.')
+  await update($, handoff, HANDOFF.release)
+  $.ui.toast(`The handoff was not copied (${TURN_ENDED[reason]}). Press Write handoff to try again.`)
 }
 
 // The save_handoff tool: copy the handoff to the clipboard, or say why not.
@@ -447,11 +468,12 @@ async function saveHandoff($: EngineInterface, raw: unknown) {
 
   const request = await read($, handoff)
   const copied = await $.ui.copy(request.phase === 'idle' ? { text } : { text, surface: request.surface })
-  await update($, handoff, () => IDLE)
+  await update($, handoff, HANDOFF.release)
   if (!copied.isCopied) {
-    $.ui.toast(`The handoff could not be copied (${copied.reason}).`)
+    const why = because(errorText(copied.reason))
+    $.ui.toast(`The handoff could not be copied ${why}.`)
     return fail(
-      `The clipboard refused it (${copied.reason}). Tell the user, and put the handoff in your reply so they can copy it themselves.`,
+      `The clipboard refused it ${why}. Tell the user, and put the handoff in your reply so they can copy it themselves.`,
     )
   }
   $.ui.toast(`Handoff copied to your clipboard, about ${tokens} tokens.`)
@@ -459,7 +481,7 @@ async function saveHandoff($: EngineInterface, raw: unknown) {
 }
 
 // Whether the session draws on the desktop app, which has its own side question: the band keeps none there.
-const isOnDesktop = async ($: EngineInterface) => (await $.session.surfaces()).includes('desktop')
+const isOnDesktop = async ($: EngineInterface) => isAppAttached(await $.session.surfaces())
 
 // Every value the band draws, and where it is drawn.
 type Band = {
@@ -495,18 +517,12 @@ function hoverCard(els: ElementTable, body: JSX.Element[]) {
   )
 }
 
-// Where a terminal card sits on the stats row: the band's width, and the column its item starts at.
-type CardSpot = { columns: number; start: number }
-
-// The terminal's card: one dim line on the item's own row, a cell past the row's end. Unkeyed Box, as above.
-// `cellsToRowEnd` is the cells from the item's start to the end of the row: the terminal paints later siblings over an earlier absolute Box,
-// so a card that began just right of its item would lose its first cells to whatever the row draws after it.
+// The terminal's card: one dim line on the item's own row, `left` cells past the item's start, which puts it a cell past the row's end
+// (cardLeft, fit.ts). Null `left`: the card would run past the band's edge, so it is not drawn. Unkeyed Box, as above.
 // A bordered box there was painted over the two rows below it.
-// The engine clips a card at the band's edge, so one that would run past it is not drawn.
-function lineCard(els: ElementTable, k: string, text: string, cellsToRowEnd: number, spot: CardSpot) {
+function lineCard(els: ElementTable, k: string, text: string, left: number | null) {
   const { Box, Text } = els
-  const left = cellsToRowEnd + 1
-  if (!cardFits(spot.columns, spot.start, left, text.length)) return null
+  if (left === null) return null
   return (
     <Box position="absolute" top={0} left={left} display="none" hover={{ display: 'flex' }}>
       <Text key={k} color="inactive">
@@ -534,20 +550,19 @@ function na(els: ElementTable, k: string, label: string) {
   )
 }
 
-// A figure in bold (or regular, for the branch), or a dim stand-in when it is missing.
-function stat(
+// A figure of the stats row in bold (or regular, for the branch), or a dim stand-in when it is missing.
+function figure(
   els: ElementTable,
-  k: string,
-  missing: string,
-  text: string | null,
+  item: RowItem,
+  isMissing: boolean,
   color: ReturnType<typeof level> | 'inactive',
   isBold = true,
 ) {
   const { Text } = els
-  if (text === null) return na(els, k, missing)
+  if (isMissing) return na(els, item.key, item.text)
   return (
-    <Text key={k} color={color} bold={isBold}>
-      {text}
+    <Text key={item.key} color={color} bold={isBold}>
+      {item.text}
     </Text>
   )
 }
@@ -555,23 +570,10 @@ function stat(
 const rateText = (label: string, used: number | null) =>
   used === null ? `${label} —` : `${label} ${Math.round(used)}%`
 
-const rateStat = (els: ElementTable, k: string, label: string, used: number | null) =>
-  stat(els, k, `${label} —`, used === null ? null : rateText(label, used), level(used ?? 0))
-
 // The context figure: in full, or short (`ctx 13%`) when the line is tight.
 const ctxText = (f: Line, isShort: boolean) => {
   if (f.ctxUsed === null || f.ctxPercent === null) return isShort ? 'ctx —' : `0/${short(f.ctxWindow)} ctx`
   return isShort ? `ctx ${f.ctxPercent}%` : `${short(f.ctxUsed)}/${short(f.ctxWindow)} ctx (${f.ctxPercent}%)`
-}
-
-function ctxLabel(els: ElementTable, f: Line, isShort: boolean) {
-  const { Text } = els
-  if (f.ctxUsed === null || f.ctxPercent === null) return na(els, 'ctx', ctxText(f, isShort))
-  return (
-    <Text key="ctx" color={level(f.ctxPercent)} bold>
-      {ctxText(f, isShort)}
-    </Text>
-  )
 }
 
 // The terminal lays out in whole cells, so it gets the text bar, as wide as the line allows.
@@ -581,11 +583,12 @@ function ctxLabel(els: ElementTable, f: Line, isShort: boolean) {
 function contextBar(els: ElementTable, b: Band) {
   const { Box, Text } = els
   const parts = b.figures.parts ?? []
-  if (b.surface !== 'terminal' && 'Svg' in els && els.Svg !== undefined) {
+  const Svg = svgOf(b.surface, els)
+  if (Svg !== null) {
     const pieces = barPieces(parts, b.figures.ctxWindow)
     return (
       <Box key="bar" flexDirection="column" flexGrow={1}>
-        <els.Svg key="svg" source={barSvg(pieces)} alt={`Context ${b.figures.ctxPercent ?? 0}% used`} height={BAR_H} />
+        <Svg key="svg" source={barSvg(pieces)} alt={`Context ${b.figures.ctxPercent ?? 0}% used`} height={BAR_H} />
         <Box key="hover" position="absolute" top={0} bottom={0} left={0} right={0} flexDirection="row">
           {pieces.map((p, i) => (
             <Box key={`seg${i}`} flexGrow={p.grow}>
@@ -616,8 +619,7 @@ function cacheItem(
   auto: AutoWarm,
   t: number,
   isTerminal: boolean,
-  cellsAfter: number,
-  spot: CardSpot,
+  row: StatsItems,
 ) {
   const { Box, Text, Button } = els
   const view = cacheView(seen, t)
@@ -634,7 +636,7 @@ function cacheItem(
             key="autowarm"
             label={auto.isOn ? 'Turn auto warm off' : 'Turn auto warm on'}
             dimColor
-            onPress={() => pressAutoWarm($)}
+            onPress={takenByPressHook}
           />,
         ]
       : [
@@ -650,7 +652,7 @@ function cacheItem(
   return (
     <Box key="cache" flexDirection="row">
       {isTerminal ? (
-        <Button key="cstate" plain label={`cache ${view.state}`} onPress={() => pressAutoWarmButton($)}>
+        <Button key="cstate" plain label={`cache ${view.state}`} onPress={takenByPressHook}>
           {stateText()}
         </Button>
       ) : (
@@ -662,7 +664,7 @@ function cacheItem(
           {AUTO_MARK}
         </Text>
       ) : null}
-      {isTerminal ? lineCard(els, 'cwhen', when, cacheCells(auto) + cellsAfter, spot) : hoverCard(els, lines)}
+      {isTerminal ? lineCard(els, 'cwhen', when, cardLeft(row, 'cache', when.length)) : hoverCard(els, lines)}
     </Box>
   )
 }
@@ -704,111 +706,110 @@ function actions($: EngineInterface, els: ElementTable, b: Band) {
   return (
     <Box key="buttons" flexDirection="row" flexShrink={0}>
       <Box key="tracerbox" flexShrink={0}>
-        <Button key="tracer" label={label.tracer} dimColor onPress={() => openTracer($)} />
+        <Button key="tracer" label={label.tracer} dimColor onPress={takenByPressHook} />
       </Box>
       <Text key="tgap">{'  '}</Text>
       <Box key="actions" flexDirection="row" flexShrink={0}>
         {label.side === null ? null : (
           <Box key="sidebox" flexShrink={0}>
-            <Button key="side" label={label.side} dimColor onPress={() => toggleSide($)} />
+            <Button key="side" label={label.side} dimColor onPress={takenByPressHook} />
           </Box>
         )}
         {label.side === null ? null : <Text key="sgap">{'  '}</Text>}
         <Box key="compactbox" flexShrink={0}>
-          <Button key="compact" label={label.compact} dimColor onPress={() => startCompact($)} />
+          <Button key="compact" label={label.compact} dimColor onPress={takenByPressHook} />
         </Box>
         <Text key="agap">{'  '}</Text>
         <Box key="handoffbox" flexShrink={0}>
-          <Button key="handoff" label={label.handoff} dimColor onPress={(press) => startHandoff($, press.surface)} />
+          <Button key="handoff" label={label.handoff} dimColor onPress={takenByPressHook} />
         </Box>
       </Box>
     </Box>
   )
 }
 
-// The Cache item's cells: `cache warm` and `cache cold` are the same length; Auto warm adds a separator and its mark.
-const cacheCells = (auto: AutoWarm) => 'cache warm'.length + (auto.isOn ? SEP_TEXT.length + AUTO_MARK.length : 0)
+// The Cache item's text: `cache warm` or `cache cold`; Auto warm adds a separator and its mark. The terminal's press is the item's own text.
+const cacheText = (seen: CacheSeen, auto: AutoWarm, t: number) =>
+  `cache ${cacheView(seen, t).state}${auto.isOn ? SEP_TEXT + AUTO_MARK : ''}`
 
-// The drawn width of each figure on the stats row.
-function widthsOf(b: Band): Widths {
+// The text of each figure on the stats row, built once a render.
+function figuresOf(b: Band): Figures<CacheSeen> {
   const f = b.figures
   return {
-    branch: (f.branch ?? 'no branch').length,
-    rate5: rateText('5h', f.rate5).length,
-    rate7: rateText('7d', f.rate7).length,
-    ctx: ctxText(f, false).length,
-    ctxShort: ctxText(f, true).length,
-    // The terminal's press is the item's own text.
-    cache: b.cache === null ? null : cacheCells(b.auto),
-    agents: agentsCells(b),
+    branch: f.branch ?? 'no branch',
+    rate5: rateText('5h', f.rate5),
+    rate7: rateText('7d', f.rate7),
+    ctx: ctxText(f, false),
+    ctxShort: ctxText(f, true),
+    cache: b.cache === null ? null : { text: cacheText(b.cache, b.auto, b.t), seen: b.cache },
+    agents: `agents ${countAgents(b.batch).live}`,
+    agentsPad: buttonPad(b.surface),
   }
-}
-
-// Which of the stats row's figures fit the band's width. An unknown width (0) shows them all.
-function shownFigures(b: Band): Shown {
-  if (b.bodyColumns <= 0) return { isBranch: true, isRate7: true, isCache: true, isAgents: true, isCtxShort: false }
-  return fit(b.bodyColumns, widthsOf(b))
 }
 
 // The Agent counter: `agents N`, N the Batch's Live agents, dim at zero. Drawn as a plain Button, the one pressable text.
 // Its card appears while the pointer is over the item (as the cache item's does).
-function agentsItem($: EngineInterface, els: ElementTable, b: Band, shown: Shown) {
+function agentsItem($: EngineInterface, els: ElementTable, b: Band, row: StatsItems) {
   const { Box, Text, Button } = els
   const { live } = countAgents(b.batch)
+  const card = agentsCard(b.batch)
   return (
     <Box key="agentsitem" flexDirection="row" flexShrink={0}>
-      <Button key="agents" label={`agents ${live}`} plain dimColor={live === 0} onPress={() => openBoard($)} />
+      <Button key="agents" label={`agents ${live}`} plain dimColor={live === 0} onPress={takenByPressHook} />
       {b.surface === 'terminal'
-        ? lineCard(els, 'acard', agentsCard(b.batch), agentsCells(b), {
-            columns: b.bodyColumns,
-            start: agentsStart(shown, widthsOf(b)),
-          })
-        : hoverCard(els, [<Text key="acard">{agentsCard(b.batch)}</Text>])}
+        ? lineCard(els, 'acard', card, cardLeft(row, 'agents', card.length))
+        : hoverCard(els, [<Text key="acard">{card}</Text>])}
     </Box>
   )
 }
 
-// `agents N` is a plain Button: its label alone in the terminal; the desktop pads its native button (a guess, two cells).
-const AGENTS_PAD_DESKTOP = 2
-const agentsCells = (b: Band) =>
-  `agents ${countAgents(b.batch).live}`.length + (b.surface === 'terminal' ? 0 : AGENTS_PAD_DESKTOP)
-
 // The blank rows above the stats row and the bar row: none on the terminal, one elsewhere, where a native button stands taller than a line.
 const rowGap = (b: Band) => (b.surface === 'terminal' ? 0 : 1)
 
-// The cells the stats row draws after the Cache item: the separator and the Agent counter, when it is shown.
-const cellsAfterCache = (b: Band, shown: Shown) => (shown.isAgents ? SEP_TEXT.length + agentsCells(b) : 0)
+// The key of the separator drawn before each figure. The branch, when drawn, is first, so it has none.
+const SEP_KEY: Record<Exclude<RowKey, 'br'>, string> = { r5: 's1', r7: 's2', ctx: 's3', cache: 's4', agents: 's6' }
+
+// One figure of the stats row (statsItems, fit.ts), with the separator before it unless it starts the row.
+function rowFigure(
+  $: EngineInterface,
+  els: ElementTable,
+  b: Band,
+  row: StatsItems<CacheSeen>,
+  item: RowItem<CacheSeen>,
+) {
+  const f = b.figures
+  const before = item.key === 'br' || item.start === 0 ? null : sep(els, SEP_KEY[item.key])
+  // The Cache item draws from the `seen` its row item carries (figuresOf).
+  const drawn =
+    item.key === 'cache'
+      ? cacheItem($, els, item.seen, b.auto, b.t, b.surface === 'terminal', row)
+      : {
+          br: () => figure(els, item, f.branch === null, 'inactive', false),
+          r5: () => figure(els, item, f.rate5 === null, level(f.rate5 ?? 0)),
+          r7: () => figure(els, item, f.rate7 === null, level(f.rate7 ?? 0)),
+          ctx: () => figure(els, item, f.ctxUsed === null || f.ctxPercent === null, level(f.ctxPercent ?? 0)),
+          agents: () => agentsItem($, els, b, row),
+        }[item.key]()
+  // Only drawn elements go in the row's list: no null among an array of children.
+  return [before, drawn].filter((e) => e !== null)
+}
 
 // Row 2: the stats alone, with the whole width. The buttons have the row above (buttonRow).
 // Off the terminal a native button stands taller than a line, so a row of margin keeps it off the stats text.
 // As the band narrows the figures drop out (fit.ts), so none wrap into a column.
+// The Agent counter sits beside the box that holds the other figures, not in it.
 function statsRow($: EngineInterface, els: ElementTable, b: Band) {
   const { Box } = els
-  const f = b.figures
-  const shown = shownFigures(b)
-  const item =
-    b.cache === null || !shown.isCache
-      ? null
-      : cacheItem($, els, b.cache, b.auto, b.t, b.surface === 'terminal', cellsAfterCache(b, shown), {
-          columns: b.bodyColumns,
-          start: cacheStart(shown, widthsOf(b)),
-        })
+  const row = statsItems(b.bodyColumns, figuresOf(b))
+  const drawn = (isAgents: boolean) =>
+    row.items.filter((i) => (i.key === 'agents') === isAgents).flatMap((i) => rowFigure($, els, b, row, i))
   return (
     <Box key="row2" flexDirection="row" alignItems="center" width="100%" marginTop={rowGap(b)}>
       <Box key="left" flexDirection="row" flexShrink={1}>
         <Box key="stats" flexDirection="row" flexShrink={1}>
-          {shown.isBranch ? stat(els, 'br', 'no branch', f.branch, 'inactive', false) : null}
-          {shown.isBranch ? sep(els, 's1') : null}
-          {rateStat(els, 'r5', '5h', f.rate5)}
-          {shown.isRate7 ? sep(els, 's2') : null}
-          {shown.isRate7 ? rateStat(els, 'r7', '7d', f.rate7) : null}
-          {sep(els, 's3')}
-          {ctxLabel(els, f, shown.isCtxShort)}
-          {item === null ? null : sep(els, 's4')}
-          {item}
+          {drawn(false)}
         </Box>
-        {shown.isAgents ? sep(els, 's6') : null}
-        {shown.isAgents ? agentsItem($, els, b, shown) : null}
+        {drawn(true)}
       </Box>
     </Box>
   )
@@ -832,16 +833,7 @@ function barRow($: EngineInterface, els: ElementTable, b: Band) {
     <Box key="row3" flexDirection="row" alignItems="center" width="100%" marginTop={rowGap(b)}>
       {contextBar(els, b)}
       <Text key="gap">{'  '}</Text>
-      <Button
-        key="details"
-        label={b.isOpen ? 'Hide details' : 'Show details'}
-        dimColor
-        onPress={async () => {
-          const opening = !b.isOpen
-          await update($, isOpen, () => opening)
-          if (opening) await refresh($)
-        }}
-      />
+      <Button key="details" label={b.isOpen ? 'Hide details' : 'Show details'} dimColor onPress={takenByPressHook} />
     </Box>
   )
 }
@@ -882,11 +874,9 @@ function sideThread(els: ElementTable, turns: Side['turns']) {
 
 // Terminal and desktop get the drawn box (askbox.tsx), full width and wrapping.
 // VS Code has no drawn boxes, so it gets the engine's field with the whole draft shown under it.
-// The mobile app draws no field yet: its table still hands one out, which draws nothing.
+// The mobile app draws no field yet (inputOf in ../surface).
 const hasDrawnBox = (els: ElementTable, surface: RenderSurface) =>
   (surface === 'terminal' || surface === 'desktop') && 'Client' in els && els.Client !== undefined
-const hasTypingField = (els: ElementTable, surface: RenderSurface) =>
-  surface !== 'mobile' && 'Input' in els && els.Input !== undefined
 
 /** What the Ask box needs from whoever draws it. */
 type AskSetup = {
@@ -928,7 +918,7 @@ function typingField($: EngineInterface, els: ElementTable, s: Side, placeholder
         placeholder={placeholder}
         submitLabel="ask"
         autoFocus
-        onInput={(v) => updateSide($, (cur) => ({ ...cur, draft: v }))}
+        onInput={(v) => update($, side, (cur) => ({ ...cur, draft: v }))}
         onSubmit={(v) => askSide($, v)}
       />
       {s.draft.trim() === '' ? null : (
@@ -949,7 +939,7 @@ const MOBILE_NOTICE = 'Type side questions in the desktop app or the terminal.'
 
 function askField($: EngineInterface, els: ElementTable, surface: RenderSurface, a: AskSetup) {
   if (hasDrawnBox(els, surface)) return drawnBox(els, a)
-  if (hasTypingField(els, surface)) return typingField($, els, a.s, a.placeholder)
+  if (inputOf(surface, els) !== null) return typingField($, els, a.s, a.placeholder)
   return (
     <els.Text key="ask" dimColor>
       {MOBILE_NOTICE}
@@ -1016,9 +1006,9 @@ function threadLine($: EngineInterface, els: ElementTable, hidden: number) {
     <Box key="threadline" flexDirection="row" justifyContent="space-between">
       <Box key="earlier">{hidden === 0 ? null : <Text color="inactive">{`Earlier ${hidden}`}</Text>}</Box>
       <Box key="threadactions" flexShrink={0}>
-        <Button key="openpane" label="Open in pane" dimColor onPress={() => openSidePane($)} />
+        <Button key="openpane" label="Open in pane" dimColor onPress={takenByPressHook} />
         <Text key="clearsep">{'  '}</Text>
-        <Button key="clearthread" label="Clear" dimColor onPress={() => clearThread($)} />
+        <Button key="clearthread" label="Clear" dimColor onPress={takenByPressHook} />
       </Box>
     </Box>
   )
@@ -1044,7 +1034,7 @@ function sideRows(
     leaves,
     isInBand: true,
   })
-  const hasBox = hasDrawnBox(els, surface) || hasTypingField(els, surface)
+  const hasBox = hasDrawnBox(els, surface) || inputOf(surface, els) !== null
   // Mobile has no box, so a saved Thread draws nothing there.
   const latest = hasBox ? s.turns.at(-1) : undefined
   return (
@@ -1097,6 +1087,10 @@ export async function sessionStart(
   // The band's last Keep-warm ping; a reload forgets it, which at worst allows one early ping.
   let ping = NO_PING
   const out = await next(e)
+  // A load or reload: the last load's waits were cancelled with it, so a busy flag they would have freed is freed here.
+  await update($, isCompacting, COMPACT.atLoad)
+  await update($, side, SIDE.atLoad)
+  await update($, handoff, HANDOFF.atLoad)
   await $.tool.register(TOOL_SPEC)
   // Every TICK_MS, so the cache item's minutes count down.
   $.clock.every(TICK_MS, () => {
@@ -1118,7 +1112,7 @@ export async function promptSubmit(
   e: EventIn<'prompt.submit'>,
   next: PlainNext<'prompt.submit'>,
 ): Promise<EventOut<'prompt.submit'>> {
-  if (e.text !== KEEP_WARM_PROMPT && (await readAuto($)).isOn) await update($, autoWarm, () => NO_AUTO_WARM)
+  if (promptEndsAutoWarm(e.text, await readAuto($))) await update($, autoWarm, () => NO_AUTO_WARM)
   return next(e)
 }
 
@@ -1150,7 +1144,7 @@ export async function turnComplete(
   e: EventIn<'turn.complete'>,
   next: PlainNext<'turn.complete'>,
 ): Promise<EventOut<'turn.complete'>> {
-  if (e.agentId === undefined) await handoffTurnEnded($)
+  if (e.agentId === undefined) await handoffTurnEnded($, e.reason)
   return next(e)
 }
 
@@ -1176,10 +1170,29 @@ function handoffHooks(on: On) {
 
   on('turn.start', async ($, e, next) => {
     if (e.text.startsWith(FIRST_LINE)) {
-      await update($, handoff, (h): Handoff => (h.phase === 'queued' ? { ...h, phase: 'writing' } : h))
+      // The turn's id is kept with the phase, so a press after a reload can still end this turn.
+      await update($, handoff, (h): Handoff =>
+        h.phase === 'queued' ? { phase: 'writing', surface: h.surface, turnId: e.turnId } : h,
+      )
     }
     return next(e)
   })
+}
+
+function pressHooks(on: On) {
+  // Every band Button press comes here; a key that is none of the band's goes on beneath.
+  on('ui.press', {}, async ($, e, next) => {
+    const name = isOwnPress(e) ? bandButtonOf(e.element) : null
+    if (name === null) return next(e)
+    // An action that does not report its own failure (a state write, the usage read) is caught here, so the press
+    // is never silently dropped to the do-nothing closure beneath the hook.
+    try {
+      await bandActions($, e.surface)[name]()
+    } catch (err) {
+      $.ui.toast(failToast(BAND_DOING[name], errorText(err)))
+    }
+    return { element: e.element }
+  }).catch(($, e, next) => next(e))
 }
 
 function bandHooks(on: On) {
@@ -1195,7 +1208,7 @@ function bandHooks(on: On) {
       read($, now),
       read($, isSideOpen),
       // Desktop has its own side question: the saved Thread is not read there.
-      e.surface === 'desktop' ? NO_SIDE : readSide($),
+      e.surface === 'desktop' ? NO_SIDE : read($, side),
       read($, keyboardLeaves),
       read($, agents),
     ])
@@ -1218,8 +1231,7 @@ function bandHooks(on: On) {
       surface: e.surface,
       bodyColumns: e.props.bodyColumns,
       isSideOpen: sideOpen,
-      // A saved list from before the board kept one, or a damaged one, reads as no Batch.
-      batch: Array.isArray(batch) ? batch : [],
+      batch,
     }
     return (
       <Box flexDirection="column">
@@ -1253,6 +1265,10 @@ function desktopNotice(els: ElementTable) {
   )
 }
 
+// Whether a keyboard move landed on one of this mod's own elements in the Band.
+const isOwnBandFocus = (e: EventIn<'ui.focus'>): boolean =>
+  e.component === 'AbovePrompt' && isOwnPress(e) && e.element !== undefined
+
 function sideHooks(on: On) {
   // The typing box's posts (askbox.tsx): each change keeps the draft, and Enter asks.
   // Its data came from code on the surface, so its shape is checked before use.
@@ -1262,7 +1278,7 @@ function sideHooks(on: On) {
     const post = e.data as Partial<AskBoxPost> | null
     if (post === null || typeof post !== 'object' || typeof post.text !== 'string') return {}
     const text = post.text
-    if (post.kind === 'draft') await updateSide($, (s) => ({ ...s, draft: text }))
+    if (post.kind === 'draft') await update($, side, (s) => ({ ...s, draft: text }))
     else if (post.kind === 'ask') await askSide($, text)
     return {}
   })
@@ -1271,7 +1287,7 @@ function sideHooks(on: On) {
   // on another site, or on something of the Band's that is not this mod's, means it left.
   on('ui.focus', async ($, e, next) => {
     const out = await next(e)
-    const isOwnBandElement = e.component === 'AbovePrompt' && e.plugin === 'desk' && e.element !== undefined
+    const isOwnBandElement = isOwnBandFocus(e)
     // Hidden, there is no Ask box to tell, and a write would redraw the Band for nothing. The desktop has no Side question at all.
     const isMove = out.deny === undefined && !isOwnBandElement && !(await isOnDesktop($)) && (await read($, isSideOpen))
     if (isMove) await update($, keyboardLeaves, (n) => n + 1)
@@ -1283,7 +1299,7 @@ function sideHooks(on: On) {
     const els = $.ui.resolve(e)
     const { Box, Text } = els
     if (e.surface === 'desktop') return desktopNotice(els)
-    const s = await readSide($)
+    const s = await read($, side)
     const placeholder = placeholderOf(s)
     // The desktop app clipped the field's lower edge: the padding gives it room.
     // Docked, the panel takes its full height and the thread takes the spare rows,
@@ -1325,6 +1341,7 @@ export const register = (on: On): void => {
   on('turn.complete', {}, turnComplete).catch(($, e, next) => next(e))
   stopHooks(on)
   handoffHooks(on)
+  pressHooks(on)
   bandHooks(on)
   sideHooks(on)
 }

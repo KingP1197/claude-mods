@@ -8,79 +8,90 @@
 // Hooks the board shares with another area (session.start, session.measure, turn.step, turn.complete, agent.spawn)
 // are exported as handlers, and ../register.tsx registers them; `register` below holds the rest.
 import { atom, read, update } from 'claude-code'
-import type { Chunk, AgentSpawnInput, ElementTable, EngineInterface, ModelUsage, On, RenderSurface } from 'claude-code'
+import type { Chunk, ElementTable, EngineInterface, On, RenderSurface } from 'claude-code'
 
-import type { EventIn, EventOut, PlainNext, StreamingNext } from '../handler'
-import type { AgentRow, CardSections, Chat, TranscriptLine, SentLine, Step } from '../../types'
+import {
+  isOwnPress,
+  takenByPressHook,
+  type EventIn,
+  type EventOut,
+  type PlainNext,
+  type StreamingNext,
+} from '../handler'
+import { because, errorText, failToast } from '../failures'
+import { isLive } from '../live'
+import { inputOf, svgOf } from '../surface'
+import type { AgentReport, AgentRow, CardSections, Chat, TranscriptLine, SentLine } from '../../types'
 import {
   BAR_KEY,
   COMMAND,
-  FINISHED_KEY,
   type SectionName,
-  earlierKey,
-  moreKey,
-  sectionKey,
   MARK,
   NUDGE,
   PANE,
+  PART_SEP,
   TOOL,
   TOOL_SPEC,
   TITLE,
-  addStep,
-  addTokens,
   barKindOf,
-  buttonOf,
-  childKey,
   cardLine,
-  changeStep,
   clockText,
-  type Early,
-  endingOf,
   fail,
-  isLive,
-  moveTo,
-  nameKey,
-  observed,
   ok,
   prettyModel,
   refusalNote,
   progress,
-  reconcile,
-  resumed,
-  settle,
   short,
-  startBatch,
   statParts,
   stepsFromReport,
   stepsFromTodos,
-  stopKey,
   type Tier,
   tierOf,
+  tokenParts,
   tokensLine,
   totals,
 } from './agents'
+import {
+  type Fact,
+  apply,
+  highestCounter,
+  newCard,
+  nextNumber,
+  noted,
+  orphanIds,
+  pruned,
+  reconcile,
+  startBatch,
+  whereTo,
+  waitingFor,
+  withEarly,
+  withoutApplied,
+} from './book'
 import { FILL_FAILED, FILL_RAISED } from './colors'
 import { BAR_H, CRITTER_H, CRITTER_W, barSvg, critterSvg, hatColor } from './critter'
-import { cutMiddle, headerCells, numsRow, targetRoom, titleParts } from './header'
+import {
+  type MetaParts,
+  type TitleParts,
+  cutMiddle,
+  headerCells,
+  metaParts,
+  numsRow,
+  partRows,
+  targetRoom,
+  titleParts,
+} from './header'
+import { BOARD_DOING, boardKey, boardPressOf, type Pressed } from './keys'
 import {
   BRIEF_CHARS,
   DIVIDER_H,
   briefShown,
-  callKey,
-  callPress,
-  thoughtKey,
-  thoughtPress,
   isThoughtOpen,
-  toggledThought,
   dividerSvg,
   isCallOpen,
   ruleLabel,
   ruleTail,
   sectionsOf,
-  toggledCall,
-  toggledEarlier,
-  toggledSection,
-  toggledWhole,
+  toggled,
 } from './sections'
 import {
   BLANK_ICON,
@@ -96,8 +107,8 @@ import {
   firstShown,
   isHung,
   isThinkingMissing,
-  isEntry,
   lineSvg,
+  newChat,
   openedSource,
   thoughtsOf,
   toolIcon,
@@ -106,6 +117,7 @@ import {
 
 // The validator reads state only through atoms declared in this file.
 const agents = atom({ plugin: 'desk', key: 'agents' } as const, [] as AgentRow[])
+const early = atom({ plugin: 'desk', key: 'early' } as const, { byAgent: {}, next: 0 })
 const openAgent = atom({ plugin: 'desk', key: 'openAgent' } as const, null)
 const now = atom({ plugin: 'desk', key: 'boardNow' } as const, 0)
 const effort = atom({ plugin: 'desk', key: 'effort' } as const, null)
@@ -114,6 +126,19 @@ const isFinishedShown = atom({ plugin: 'desk', key: 'isFinishedShown' } as const
 const chat = atom({ plugin: 'desk', key: 'chat' } as const, null as Chat | null)
 const sectionLog = atom({ plugin: 'desk', key: 'sections' } as const, {} as Record<string, CardSections>)
 const sentLog = atom({ plugin: 'desk', key: 'sent' } as const, {} as Record<string, SentLine[]>)
+
+/** A saved Chat with its defaults filled: one saved by an older board may lack a count or a mark. */
+function chatOf(c: Chat | null): Chat | null {
+  if (c === null) return null
+  const saved: Partial<Chat> = c
+  return {
+    ...c,
+    dropped: saved.dropped ?? 0,
+    isUnread: saved.isUnread ?? false,
+    isThinkingMissing: saved.isThinkingMissing ?? false,
+    sent: saved.sent ?? 0,
+  }
+}
 
 // The one clock the cards count from. It only moves forward.
 function advance($: EngineInterface, t: number) {
@@ -133,7 +158,11 @@ async function tick($: EngineInterface) {
   }
   const shown = await read($, openAgent)
   const agentId = rows.find((r) => r.id === shown)?.agentId ?? null
-  if (agentId !== null) await loadChat($, agentId)
+  if (agentId === null) return
+  // A card opened while Starting has no Chat; the spawn's answer gave it an agent, so its Transcript starts now.
+  if ((await read($, chat))?.agentId !== agentId)
+    await update($, chat, (c) => (c?.agentId === agentId ? c : newChat(agentId)))
+  await loadChat($, agentId)
 }
 
 /** Reads the open card's agent's conversation into the chat view as Transcript entries, if that card is still the open one. */
@@ -166,55 +195,42 @@ async function loadChat($: EngineInterface, agentId: string) {
   )
 }
 
-function toggleSection($: EngineInterface, id: string, which: SectionName) {
-  return update($, sectionLog, (saved) => toggledSection(saved, id, which))
-}
-
-function toggleWhole($: EngineInterface, id: string) {
-  return update($, sectionLog, (saved) => toggledWhole(saved, id))
-}
-
-function toggleEarlier($: EngineInterface, id: string) {
-  return update($, sectionLog, (saved) => toggledEarlier(saved, id))
-}
-
-function toggleCall($: EngineInterface, id: string, callId: string) {
-  return update($, sectionLog, (saved) => toggledCall(saved, id, callId))
-}
-
-function toggleThought($: EngineInterface, id: string, thoughtId: string) {
-  return update($, sectionLog, (saved) => toggledThought(saved, id, thoughtId))
-}
-
-function toggleFinished($: EngineInterface) {
-  return update($, isFinishedShown, (v) => !v)
-}
-
 // Whether the board had the keyboard at its last drawing. The desktop app spends a first click on an
 // unfocused board on focusing it and sends the button no press, so the focus hook presses it instead.
 let isBoardFocused = false
 
-/** Runs the card-bound button a first click landed on: the card's name or its Stop. */
-async function pressOnCard($: EngineInterface, button: { kind: 'name' | 'stop' | 'child'; id: string }) {
-  const r = (await read($, agents)).find((x) => x.id === button.id)
+/** Runs a card-bound button: the card's name, an Agent call's row (the child's card), or the card's Stop. The card
+ *  is read now, not when the button was drawn. */
+async function pressOnCard($: EngineInterface, id: string, isStop: boolean) {
+  const r = (await read($, agents)).find((x) => x.id === id)
   if (r === undefined) return
-  if (button.kind !== 'stop') return toggleCard($, r)
+  if (!isStop) return toggleCard($, r)
   if (r.agentId !== null && isLive(r)) return stopAgent($, r.agentId)
 }
 
-/** Runs the button a first click on the unfocused board landed on, as its onPress would. */
-async function pressByKey($: EngineInterface, key: string | undefined) {
-  const call = callPress(key)
-  if (call !== null) return toggleCall($, call.id, call.callId)
-  const thought = thoughtPress(key)
-  if (thought !== null) return toggleThought($, thought.id, thought.thoughtId)
-  const button = buttonOf(key)
-  if (button === null) return
-  if (button.kind === 'finished') return toggleFinished($)
-  if (button.kind === 'section') return toggleSection($, button.id, button.which)
-  if (button.kind === 'more') return toggleWhole($, button.id)
-  if (button.kind === 'earlier') return toggleEarlier($, button.id)
-  return pressOnCard($, button)
+/** The board's one press table: what the button drawn with `key` does. The board's `ui.press` hook and a first click on
+ *  the unfocused board, which arrives only as focus landing on the key, both run it. A press the engine refuses
+ *  (every action reads or writes saved state, so any can) is told to the user: the press hook's catch would
+ *  otherwise hand it on to a do-nothing closure. */
+async function press($: EngineInterface, key: string | undefined) {
+  const p = boardPressOf(key)
+  if (p === null) return
+  await pressed($, p).catch((err: unknown) => {
+    $.ui.toast(failToast(BOARD_DOING[p.kind], errorText(err)))
+  })
+}
+
+async function pressed($: EngineInterface, p: Pressed) {
+  switch (p.kind) {
+    case 'finished':
+      return update($, isFinishedShown, (v) => !v)
+    case 'name':
+    case 'child':
+    case 'stop':
+      return pressOnCard($, p.id, p.kind === 'stop')
+    default:
+      return update($, sectionLog, (saved) => toggled(saved, p))
+  }
 }
 
 /** Opens a card, or closes it when it is the open one. Opening reads its agent's last messages. */
@@ -224,18 +240,20 @@ async function toggleCard($: EngineInterface, r: AgentRow) {
     isOpening = cur !== r.id
     return isOpening ? r.id : null
   })
-  const fresh: Chat | null =
-    isOpening && r.agentId !== null ? { agentId: r.agentId, lines: [], note: null, sent: 0 } : null
+  const fresh: Chat | null = isOpening && r.agentId !== null ? newChat(r.agentId) : null
   await update($, chat, () => fresh)
   if (fresh !== null) await loadChat($, fresh.agentId)
 }
 
 function noteChat($: EngineInterface, agentId: string, note: string, isSent = false) {
-  return update($, chat, (c) => (c?.agentId === agentId ? { ...c, note, sent: c.sent + (isSent ? 1 : 0) } : c))
+  return update($, chat, (saved) => {
+    const c = chatOf(saved)
+    return c?.agentId === agentId ? { ...c, note, sent: c.sent + (isSent ? 1 : 0) } : saved
+  })
 }
 
 /** A call that threw reads as a refusal with the error as its reason. */
-const thrownAsDeny = (err: unknown) => ({ deny: String(err) })
+const thrownAsDeny = (err: unknown) => ({ deny: errorText(err) })
 
 /** Sends the user's message to the agent. A running agent gets it as a plain user message in its conversation,
  *  as the built-in agent window's messages read; a finished one (or a refused append) gets it delivered, which
@@ -259,12 +277,12 @@ async function sendTo($: EngineInterface, agentId: string, isRunning: boolean, t
   }
   const delivery = await $.session.send({ to: { agentId }, text }).catch((err: unknown) => ({
     isDelivered: false as const,
-    reason: String(err),
+    reason: errorText(err),
   }))
   if (!delivery.isDelivered) return noteChat($, agentId, refusalNote('SendMessage', delivery.reason))
   await remember()
   await noteChat($, agentId, 'Sent. It reads it at its next step.', true)
-  await changeAgent($, agentId, resumed)
+  await changeCard($, agentId, { kind: 'resumed' }, await $.clock.now())
   await loadChat($, agentId)
 }
 
@@ -275,109 +293,63 @@ async function stopAgent($: EngineInterface, agentId: string) {
   const refused = 'deny' in out ? out.deny : out.isError === true ? out.text : undefined
   if (refused !== undefined) return noteChat($, agentId, refusalNote('TaskStop', refused))
   const t = await $.clock.now()
-  await changeAgent($, agentId, (x) => moveTo(x, 'stopped', t))
+  await changeCard($, agentId, { kind: 'stopped' }, t)
   await noteChat($, agentId, 'Stopped.')
 }
 
-/** Changes the row of one agent; false when no row carries that agentId yet. */
-async function changeAgent($: EngineInterface, agentId: string, change: (r: AgentRow) => AgentRow) {
-  let isFound = false
-  await update($, agents, (list) =>
-    list.map((r) => {
-      if (r.agentId !== agentId) return r
-      isFound = true
-      return change(r)
-    }),
-  )
-  return isFound
+/** Applies a fact to the card linked to `agentId`. */
+function changeCard($: EngineInterface, agentId: string, fact: Fact, t: number) {
+  return update($, agents, (list) => apply(list, { agentId }, fact, t))
 }
 
 /** Opens the board, or says why it could not. */
 async function openBoard($: EngineInterface): Promise<string> {
   const r = await $.ui.open({ id: PANE, title: TITLE })
-  return r.isPlaced ? 'Agent board opened.' : `Could not open the agent board (${r.reason}).`
+  return r.isPlaced ? 'Agent board opened.' : `Could not open the agent board ${because(errorText(r.reason))}.`
 }
 
-// What an agent reported before its spawn answered. Each hook notes its fact here first, then
-// changes the row if one exists; whichever of the two the spawn misses, the other catches.
-type Notes = { early: Map<string, Early>; note: (agentId: string, fact: Early) => void }
+/** Takes out of the early store the reports their cards have applied. It runs only after the card is saved, so a
+ *  reload between the two saves loses no report: the card keeps it, and the next take skips it. */
+async function dropApplied($: EngineInterface) {
+  const rows = await read($, agents)
+  await update($, early, (store) => withoutApplied(store, rows))
+}
 
-function makeNotes(): Notes {
-  const early = new Map<string, Early>()
-  const note = (agentId: string, fact: Early) => {
-    early.set(agentId, { ...early.get(agentId), ...fact })
-  }
-  return { early, note }
+/** Applies the reports still waiting for `agentId`'s card to it, then takes them out of the early store. */
+async function catchUp($: EngineInterface, agentId: string) {
+  const reports = waitingFor(await read($, early), agentId)
+  if (reports.length === 0) return
+  await update($, agents, (list) => withEarly(list, agentId, reports))
+  await dropApplied($)
+}
+
+/** Drops the early reports no card can take any more. Only reports from before the cards were read can go. */
+async function prune($: EngineInterface) {
+  const before = nextNumber(await read($, early))
+  const rows = await read($, agents)
+  await update($, early, (store) => pruned(store, rows, before))
+}
+
+/** Records what an agent reported: on its card once its spawn has answered, else in the early store, with its time. */
+async function tell($: EngineInterface, agentId: string, report: AgentReport) {
+  const t = await $.clock.now()
+  // Held in an object: TypeScript would read a plain variable as still 'nowhere', not seeing the write inside update.
+  const found: { where: ReturnType<typeof whereTo> } = { where: 'nowhere' }
+  await update($, agents, (list) => {
+    found.where = whereTo(list, agentId)
+    return found.where === 'card' ? apply(list, { agentId }, report, t) : list
+  })
+  if (found.where !== 'early') return
+  await update($, early, (store) => noted(store, agentId, report, t))
+  // Its spawn may have answered while the report was being saved; then the card takes it now.
+  if ((await read($, agents)).some((r) => r.agentId === agentId)) await catchUp($, agentId)
 }
 
 // A model request's start says the model and effort it runs on. The main thread's
-// effort is the session's; a subagent's own requests replace the guess on its row.
-async function noteStep(
-  $: EngineInterface,
-  notes: Notes,
-  agentId: string | undefined,
-  model: string,
-  lvl: string | null,
-) {
-  if (agentId === undefined) {
-    if (lvl !== null && lvl !== (await read($, effort))) await update($, effort, () => lvl)
-    return
-  }
-  notes.note(agentId, { step: { model, effort: lvl } })
-  if (await changeAgent($, agentId, (r) => observed(r, model, lvl))) notes.early.delete(agentId)
-}
-
-// A subagent's model request ended: add its counts. Each request is keyed, so it counts once.
-async function noteUsage($: EngineInterface, notes: Notes, agentId: string, key: string, usage: ModelUsage) {
-  notes.note(agentId, { tokens: addTokens(notes.early.get(agentId)?.tokens, usage, key) })
-  if (await changeAgent($, agentId, (r) => ({ ...r, tokens: addTokens(r.tokens, usage, key) })))
-    notes.early.delete(agentId)
-}
-
-const withSteps = (r: AgentRow, steps: Step[] | undefined): AgentRow => (steps === undefined ? r : { ...r, steps })
-
-// A subagent changed its to-do list.
-async function noteSteps(
-  $: EngineInterface,
-  notes: Notes,
-  agentId: string,
-  change: (steps: readonly Step[] | undefined) => Step[] | undefined,
-) {
-  notes.note(agentId, { steps: change(notes.early.get(agentId)?.steps) })
-  if (await changeAgent($, agentId, (r) => withSteps(r, change(r.steps)))) notes.early.delete(agentId)
-}
-
-// A new agent's row, before its spawn answers.
-function spawnRow(
-  e: AgentSpawnInput,
-  id: string,
-  asked: string | undefined,
-  sessionEffort: string | null,
-  t: number,
-): AgentRow {
-  return {
-    id,
-    agentId: null,
-    description: e.description.trim() === '' ? e.subagentType : e.description,
-    type: e.subagentType,
-    model: e.model ?? null,
-    effort: asked ?? sessionEffort,
-    isEffortInherited: asked === undefined,
-    isTeammate: e.isTeammate === true,
-    isWorkflow: e.workflow !== undefined,
-    parentAgentId: e.parentAgentId ?? null,
-    task: e.prompt,
-    startedAt: t,
-    endedAt: null,
-    state: 'running',
-  }
-}
-
-// A subagent's turn ending ends it; a teammate's only idles it.
-async function agentTurnEnded($: EngineInterface, notes: Notes, agentId: string, reason: string) {
-  const t = await $.clock.now()
-  notes.note(agentId, { reason })
-  if (await changeAgent($, agentId, (r) => moveTo(r, endingOf(reason, r.isTeammate), t))) notes.early.delete(agentId)
+// effort is the session's; a subagent's own requests replace the guess on its card.
+async function noteStep($: EngineInterface, agentId: string | undefined, model: string, lvl: string | null) {
+  if (agentId !== undefined) return tell($, agentId, { kind: 'step', model, effort: lvl })
+  if (lvl !== null && lvl !== (await read($, effort))) await update($, effort, () => lvl)
 }
 
 /** The new task's id in a TaskCreate result, read with care: the result's shape is the tool's. */
@@ -426,14 +398,9 @@ function statCards(els: ElementTable, b: Board) {
   )
 }
 
-// The Svg element, or null where this surface draws no pictures (the terminal, and any surface without one).
-// There text marks stand in for the pictures.
-const svgOf = (els: ElementTable, b: Board) =>
-  b.surface !== 'terminal' && 'Svg' in els && els.Svg !== undefined ? els.Svg : null
-
 // The critter, off the terminal only: the terminal draws no pictures.
 function critter(els: ElementTable, b: Board, r: AgentRow, tier: Tier) {
-  const Svg = svgOf(els, b)
+  const Svg = svgOf(b.surface, els)
   if (Svg === null) return null
   const isFaded = r.state === 'failed' || r.state === 'stopped' || r.state === 'lost'
   return (
@@ -465,7 +432,7 @@ function bar(els: ElementTable, b: Board, r: AgentRow) {
   const f = progress(r)
   if (f === null) return null
   const kind = barKindOf(r.state)
-  const Svg = svgOf(els, b)
+  const Svg = svgOf(b.surface, els)
   if (Svg !== null) {
     const alt = r.state === 'done' ? 'Finished' : `${Math.round(f * 100)}% of its to-do list done`
     return (
@@ -498,7 +465,7 @@ const ruleCells = (b: Board) => Math.max(10, b.bodyColumns - 2)
 // The line that opens the footer: a picture off the terminal; on it a bare rule from edge to edge.
 function footerRule(els: ElementTable, b: Board) {
   const { Box, Text } = els
-  const Svg = svgOf(els, b)
+  const Svg = svgOf(b.surface, els)
   if (Svg !== null) {
     return (
       <Box key="divider:footer" flexDirection="column" marginTop={1}>
@@ -530,16 +497,9 @@ function sectionHead(
   const { Box, Text, Button } = els
   const isOpen =
     which === 'brief' ? sectionsOf(b.sections, r.id).isBriefOpen : sectionsOf(b.sections, r.id).isTranscriptOpen
-  const chevron = (
-    <Button
-      key={sectionKey(r.id, which)}
-      plain
-      dimColor
-      label={isOpen ? '▾' : '▸'}
-      onPress={() => toggleSection($, r.id, which)}
-    />
-  )
-  const Svg = svgOf(els, b)
+  const key = boardKey({ kind: 'section', id: r.id, which })
+  const chevron = <Button key={key} plain dimColor label={isOpen ? '▾' : '▸'} onPress={takenByPressHook} />
+  const Svg = svgOf(b.surface, els)
   if (Svg !== null) {
     return [
       <Box key={`divider:${which}`} flexDirection="column" marginTop={1}>
@@ -579,6 +539,7 @@ function sectionHead(
 function briefSection($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
   const { Box, Text, Button } = els
   const sections = sectionsOf(b.sections, r.id)
+  const more = boardKey({ kind: 'more', id: r.id })
   return [
     ...sectionHead($, els, b, r, 'brief', 'Brief'),
     sections.isBriefOpen ? (
@@ -588,11 +549,11 @@ function briefSection($: EngineInterface, els: ElementTable, b: Board, r: AgentR
         </Text>
         {r.task.length > BRIEF_CHARS ? (
           <Button
-            key={moreKey(r.id)}
+            key={more}
             plain
             dimColor
             label={sections.isBriefWhole ? 'Show less' : 'Show whole brief'}
-            onPress={() => toggleWhole($, r.id)}
+            onPress={takenByPressHook}
           />
         ) : null}
       </Box>
@@ -607,7 +568,7 @@ type Flow = { card: string; lines: readonly TranscriptLine[]; first: number; isR
 // for the last of its run), the icon of the tool of that name and the name.
 function rowLead(els: ElementTable, b: Board, flow: Flow, i: number, name: string, isLive = false) {
   const { Text } = els
-  const Svg = svgOf(els, b)
+  const Svg = svgOf(b.surface, els)
   const picture = toolIcon(name)
   return [
     Svg === null ? (
@@ -658,9 +619,16 @@ const roomOf = (b: Board, name: string, tail: ReturnType<typeof tailOf>, hasChev
 /** How a Tool call's row ends: whose Card an Agent call opens, whether the call is in flight, its tail, and the cells its target may take. */
 type Tail = { child: AgentRow | null; isLive: boolean; tail: ReturnType<typeof tailOf>; room: number }
 
+/** The button an Agent call's target becomes: it opens the child's Card. */
+function childButton($: EngineInterface, els: ElementTable, child: AgentRow, label: string) {
+  const { Button } = els
+  const key = boardKey({ kind: 'child', id: child.id })
+  return <Button key={key} plain dimColor label={label} onPress={takenByPressHook} />
+}
+
 // The end of a Tool call's row: what it touched, cut in the middle to the cells the row leaves it, then the tail.
 function toolTail($: EngineInterface, els: ElementTable, l: Extract<TranscriptLine, { kind: 'tool' }>, t: Tail) {
-  const { Box, Text, Button } = els
+  const { Box, Text } = els
   const { child } = t
   const target = l.target ? cutMiddle(l.target, t.room) : null
   return [
@@ -669,7 +637,7 @@ function toolTail($: EngineInterface, els: ElementTable, l: Extract<TranscriptLi
         {child === null ? (
           <Text {...(t.isLive ? { color: 'claude', bold: true } : { color: 'inactive' })}>{target}</Text>
         ) : (
-          <Button key={childKey(child.id)} plain dimColor label={target} onPress={() => toggleCard($, child)} />
+          childButton($, els, child, target)
         )}
       </Box>
     ) : null,
@@ -719,12 +687,12 @@ function toolEntry(
   l: Extract<TranscriptLine, { kind: 'tool' }>,
 ) {
   const { Box, Button } = els
-  const callId = l.id
+  const key = boardKey({ kind: 'call', id: flow.card, callId: l.id })
   // An Agent call whose child the board holds draws as an Agent call, in flight or not.
   const child = childOf(b.rows, flow.card, l)
   const isLive = flow.isRunning && l.isInFlight === true && child === null
-  const isOpenable = callId !== undefined && hasDetail(l, isLive)
-  const isOpen = isOpenable && isCallOpen(b.sections, flow.card, callId, l.isFailed === true)
+  const isOpenable = hasDetail(l, isLive)
+  const isOpen = isOpenable && isCallOpen(b.sections, flow.card, l.id, l.isFailed)
   const tail = tailOf(l, child, isLive)
   const room = roomOf(b, l.name, tail, isOpenable)
   return (
@@ -736,15 +704,7 @@ function toolEntry(
       <Box key="tool" flexDirection="row" gap={1}>
         {rowLead(els, b, flow, i, l.name, isLive)}
         {toolTail($, els, l, { child, isLive, tail, room })}
-        {isOpenable ? (
-          <Button
-            key={callKey(flow.card, callId)}
-            plain
-            dimColor
-            label={isOpen ? '▾' : '▸'}
-            onPress={() => toggleCall($, flow.card, callId)}
-          />
-        ) : null}
+        {isOpenable ? <Button key={key} plain dimColor label={isOpen ? '▾' : '▸'} onPress={takenByPressHook} /> : null}
       </Box>
       {isOpen ? toolDetail(els, b, l) : null}
     </Box>
@@ -762,18 +722,13 @@ function thoughtEntry(
 ) {
   const { Box, Text, Button } = els
   const isOpen = isThoughtOpen(b.sections, flow.card, l.id)
+  const key = boardKey({ kind: 'thought', id: flow.card, thoughtId: l.id })
   return (
     <Box key="thought" flexDirection="column">
       <Box key="tool" flexDirection="row" gap={1}>
         {rowLead(els, b, flow, i, 'Thought')}
         <Box key="room" flexGrow={1} />
-        <Button
-          key={thoughtKey(flow.card, l.id)}
-          plain
-          dimColor
-          label={isOpen ? '▾' : '▸'}
-          onPress={() => toggleThought($, flow.card, l.id)}
-        />
+        <Button key={key} plain dimColor label={isOpen ? '▾' : '▸'} onPress={takenByPressHook} />
       </Box>
       {isOpen ? (
         <Box key="detail" marginLeft={4} flexDirection="column">
@@ -788,7 +743,7 @@ function thoughtEntry(
 // What leads a message's first row: its dot, or in the terminal `⏺` or `>`.
 function messageMark(els: ElementTable, b: Board, flow: Flow, i: number, dot: Dot) {
   const { Text } = els
-  const Svg = svgOf(els, b)
+  const Svg = svgOf(b.surface, els)
   if (Svg === null)
     return (
       <Text key="mark" color={dot === 'writing' ? 'claude' : 'inactive'}>
@@ -852,7 +807,7 @@ function messageEntry(
   l: Extract<TranscriptLine, { text: string }>,
 ) {
   const { Box, Text } = els
-  const Svg = svgOf(els, b)
+  const Svg = svgOf(b.surface, els)
   const rows = textRows(b, l.text)
   const hasBelow = i < flow.lines.length - 1
   return (
@@ -908,7 +863,7 @@ function chatLines($: EngineInterface, els: ElementTable, b: Board, r: AgentRow,
     </Text>
   )
   if (c.lines === null) return unread
-  const lines = c.lines.filter(isEntry)
+  const lines = c.lines
   if (lines.length === 0)
     return (
       <Text key="unread" color="inactive">
@@ -916,26 +871,27 @@ function chatLines($: EngineInterface, els: ElementTable, b: Board, r: AgentRow,
       </Text>
     )
   const isAll = sectionsOf(b.sections, r.id).isEarlierShown
+  const earlier = boardKey({ kind: 'earlier', id: r.id })
   const first = firstShown(lines.length, isAll)
   const body = (
     <Box key="lines" flexDirection="column">
-      {c.isThinkingMissing === true ? (
+      {c.isThinkingMissing ? (
         <Text key="thinking-missing" color="inactive">
           Thinking is not available for this agent
         </Text>
       ) : null}
-      {(c.dropped ?? 0) > 0 ? (
+      {c.dropped > 0 ? (
         <Text key="dropped" color="inactive">
           {`Earlier entries dropped: ${c.dropped}.`}
         </Text>
       ) : null}
       {firstShown(lines.length, false) > 0 ? (
         <Button
-          key={earlierKey(r.id)}
+          key={earlier}
           plain
           dimColor
           label={isAll ? 'Show fewer' : `Show ${first} earlier`}
-          onPress={() => toggleEarlier($, r.id)}
+          onPress={takenByPressHook}
         />
       ) : null}
       {lines.map((_, i) =>
@@ -944,7 +900,7 @@ function chatLines($: EngineInterface, els: ElementTable, b: Board, r: AgentRow,
     </Box>
   )
   // The user's own messages still show, under a note that the agent's could not be read.
-  return c.isUnread === true ? (
+  return c.isUnread ? (
     <Box key="chat" flexDirection="column">
       {unread}
       {body}
@@ -954,9 +910,10 @@ function chatLines($: EngineInterface, els: ElementTable, b: Board, r: AgentRow,
   )
 }
 
-// The box to message the agent. The phone app draws no text field, so there it says where to type instead.
-function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, agentId: string, c: Chat | null) {
-  if (!('Input' in els) || els.Input === undefined)
+// The box to message the agent. The phone draws no text field (its table's Input draws nothing), so there it says where to type instead.
+function sayBox($: EngineInterface, els: ElementTable, b: Board, r: AgentRow, agentId: string, c: Chat | null) {
+  const Input = inputOf(b.surface, els)
+  if (Input === null)
     return (
       <els.Text key="say-elsewhere" color="inactive" wrap="wrap">
         Message it from the desktop app or the terminal.
@@ -964,7 +921,7 @@ function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, agentId: str
     )
   // A fresh key after each send draws an empty box.
   return (
-    <els.Input
+    <Input
       key={`say:${r.id}:${c?.sent ?? 0}`}
       placeholder={isLive(r) ? 'Message this agent' : 'Message it to pick up again'}
       submitLabel="send"
@@ -976,13 +933,14 @@ function sayBox($: EngineInterface, els: ElementTable, r: AgentRow, agentId: str
 // The footer of an opened card: its rule, the box to message the agent, and Stop while it runs, and the last send's note.
 function footer($: EngineInterface, els: ElementTable, b: Board, r: AgentRow, agentId: string, c: Chat | null) {
   const { Box, Text, Button } = els
+  const stop = boardKey({ kind: 'stop', id: r.id })
   return [
     footerRule(els, b),
     <Box key="say-row" flexDirection="row" gap={1} marginTop={1} {...insetOf(b)}>
       <Box key="say-box" flexGrow={1} flexShrink={1}>
-        {sayBox($, els, r, agentId, c)}
+        {sayBox($, els, b, r, agentId, c)}
       </Box>
-      {isLive(r) ? <Button key={stopKey(r.id)} label="Stop" onPress={() => stopAgent($, agentId)} /> : null}
+      {isLive(r) ? <Button key={stop} label="Stop" onPress={takenByPressHook} /> : null}
     </Box>,
     c === null || c.note === null ? null : (
       <Box key="note-room" {...insetOf(b)}>
@@ -1015,7 +973,7 @@ function talk($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
       r,
       'transcript',
       'Transcript',
-      c === null || c.lines === null ? null : c.lines.length + (c.dropped ?? 0),
+      c === null || c.lines === null ? null : c.lines.length + c.dropped,
     ),
     sectionsOf(b.sections, r.id).isTranscriptOpen ? (
       <Box key="transcript-body" marginTop={1} {...insetOf(b)}>
@@ -1026,32 +984,37 @@ function talk($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
   ]
 }
 
-// The type line: agent type, effort word and model, set apart by dim separators. A long type is cut short.
-function typeLine(els: ElementTable, r: AgentRow, tier: Tier) {
+// The type line: agent type, effort word and model, set apart by dim separators. The header has already cut them to its
+// cells (metaParts), and a separator is drawn only between two parts that are drawn. The engine cannot be trusted to
+// shrink a row, so the type is not asked to: it is drawn as cut, with no shrink or truncate setting, and the rest of
+// the row (the `effort-room` Box) is held at its size.
+function typeLine(els: ElementTable, meta: MetaParts) {
   const { Box, Text } = els
   return (
     <Box key="who" flexDirection="row">
-      {r.type === '' ? null : (
-        <Box key="type-room" flexShrink={1} minWidth={0}>
-          <Text key="type" color="inactive" wrap="truncate-end">
-            {r.type}
-          </Text>
-        </Box>
+      {meta.type === '' ? null : (
+        <Text key="type" color="inactive">
+          {meta.type}
+        </Text>
       )}
       <Box key="effort-room" flexShrink={0}>
-        {r.type === '' ? null : (
+        {meta.type === '' ? null : (
           <Text key="sep-type" color="subtle">
-            {' | '}
+            {PART_SEP}
           </Text>
         )}
-        <Text key="tier" color="inactive">
-          {tier.label}
-        </Text>
-        <Text key="sep-model" color="subtle">
-          {' | '}
-        </Text>
+        {meta.effort === '' ? null : (
+          <Text key="tier" color="inactive">
+            {meta.effort}
+          </Text>
+        )}
+        {meta.effort === '' ? null : (
+          <Text key="sep-model" color="subtle">
+            {PART_SEP}
+          </Text>
+        )}
         <Text key="model" color="inactive">
-          {prettyModel(r.model)}
+          {meta.model}
         </Text>
       </Box>
     </Box>
@@ -1060,12 +1023,14 @@ function typeLine(els: ElementTable, r: AgentRow, tier: Tier) {
 
 // The card's first row: its name, and its state mark at the right edge. In the terminal a hat mark leads the
 // name; the name gives way before the state mark does, so a narrow pane keeps the mark.
-function titleRow($: EngineInterface, els: ElementTable, b: Board, r: AgentRow, tier: Tier, cells: number) {
+function titleRow($: EngineInterface, els: ElementTable, b: Board, r: AgentRow, tier: Tier, parts: TitleParts) {
   const { Box, Text, Button } = els
   const mark = MARK[r.state]
-  const parts = titleParts(r.description, r.state, cells)
+  const key = boardKey({ kind: 'name', id: r.id })
+  // The label carries the cut name too: the desktop app draws a Button's label, not the Text inside it (the user's
+  // 2026-10-15 screenshot showed the whole name pushing the header past the Card's edge); the terminal draws the Text.
   const name = (
-    <Button key={nameKey(r.id)} plain label={r.description} onPress={() => toggleCard($, r)}>
+    <Button key={key} plain label={parts.name} onPress={takenByPressHook}>
       <Text color="text" bold>
         {parts.name}
       </Text>
@@ -1081,7 +1046,7 @@ function titleRow($: EngineInterface, els: ElementTable, b: Board, r: AgentRow, 
       </Text>
     </Box>
   )
-  const isHatShown = svgOf(els, b) === null
+  const isHatShown = svgOf(b.surface, els) === null
   return (
     <Box key="top" flexDirection="row" justifyContent="space-between">
       {isHatShown ? (
@@ -1124,19 +1089,61 @@ function metricsBox(els: ElementTable, stats: string) {
   )
 }
 
+// The open Card's token line. The terminal wraps it as one Text. The desktop app wraps a Text inside its parts, where a
+// row could begin with `|` (the user's 2026-10-15 screenshot), so there the parts share the header's `cells` by rows.
+function tokensBox(els: ElementTable, b: Board, r: AgentRow, cells: number) {
+  const { Box, Text } = els
+  const lines = b.surface === 'terminal' ? [tokensLine(r)] : partRows(tokenParts(r), cells)
+  return (
+    <Box key="details" flexDirection="column" marginTop={1}>
+      {/* A drawn Text loses its key, so the lines sit in a keyed Box. */}
+      <Box key="tokens" flexDirection="column">
+        {lines.map((line, i) => (
+          <Text key={`tokens-${i}`} color="inactive" wrap="wrap">
+            {line}
+          </Text>
+        ))}
+      </Box>
+    </Box>
+  )
+}
+
+// Where the title cuts the name, the open Card draws all of it once, dim and wrapping, under the title: the design
+// foundations keep a way to see the whole of a cut label.
+function fullName(els: ElementTable, r: AgentRow, title: TitleParts, isOpen: boolean) {
+  const { Box, Text } = els
+  if (!isOpen || title.name === r.description || r.description.trim() === '') return null
+  return (
+    <Box key="full-name">
+      <Text color="inactive" wrap="wrap">
+        {r.description}
+      </Text>
+    </Box>
+  )
+}
+
 function agentCard($: EngineInterface, els: ElementTable, b: Board, r: AgentRow) {
   const { Box, Text } = els
   const tier = tierOf(r.effort)
   const cells = headerCells(b.surface === 'terminal', insideCard(b))
   const { steps, stats, isStacked } = numsRow(cardLine(r), statParts(r, b.t, b.window), cells)
   const isOpen = b.shown === r.id
+  const title = titleParts(r.description, r.state, cells)
   return (
     <Box key={`card:${r.id}`} flexDirection="column" marginBottom={1} {...blockOf(b)}>
       <Box key="header" flexDirection="row" gap={1} {...insetOf(b)}>
         {critter(els, b, r, tier)}
         <Box key="body" flexDirection="column" flexGrow={1} flexShrink={1}>
-          {titleRow($, els, b, r, tier, cells)}
-          {typeLine(els, r, tier)}
+          {titleRow($, els, b, r, tier, title)}
+          {fullName(els, r, title, isOpen)}
+          {typeLine(
+            els,
+            metaParts(
+              { type: r.type, effort: tier.label, model: prettyModel(r.model) },
+              cells,
+              svgOf(b.surface, els) !== null,
+            ),
+          )}
           {/* A long step name gives way, cut short with an ellipsis; the numbers keep one line. */}
           <Box key="nums" flexDirection="row" justifyContent={steps === '' ? 'flex-end' : 'space-between'} gap={1}>
             {steps === '' ? null : (
@@ -1154,13 +1161,7 @@ function agentCard($: EngineInterface, els: ElementTable, b: Board, r: AgentRow)
             </Box>
           )}
           {bar(els, b, r)}
-          {isOpen ? (
-            <Box key="details" marginTop={1}>
-              <Text key="tokens" color="inactive" wrap="wrap">
-                {tokensLine(r)}
-              </Text>
-            </Box>
-          ) : null}
+          {isOpen ? tokensBox(els, b, r, cells) : null}
         </Box>
       </Box>
       {/* The sections sit below the header, outside its inset, so their dividers reach the Card's edges. */}
@@ -1185,14 +1186,15 @@ function finishedSection($: EngineInterface, els: ElementTable, b: Board) {
   const { Box, Button } = els
   const ended = b.rows.filter((r) => !isLive(r))
   if (ended.length === 0) return null
+  const finished = boardKey({ kind: 'finished' })
   return (
     <Box key="finished" flexDirection="column">
       <Button
-        key={FINISHED_KEY}
+        key={finished}
         plain
         dimColor
         label={`${b.isFinishedShown ? '▾' : '▸'} Finished | ${ended.length}`}
-        onPress={() => toggleFinished($)}
+        onPress={takenByPressHook}
       />
       {b.isFinishedShown ? ended.map((r) => agentCard($, els, b, r)) : null}
     </Box>
@@ -1203,8 +1205,13 @@ function finishedSection($: EngineInterface, els: ElementTable, b: Board) {
 // this plugin were absent, and a next() it already made is replayed, never run twice.
 
 // The board's links between events, rebuilt on every load (register resets them).
-let notes = makeNotes()
 let seq = 0
+// The ids of the cards whose spawn this copy of the board is waiting on. A card still waiting that is not here was
+// begun by a copy a reload replaced. UNVERIFIED: that the old copy's hook stops and nothing will answer for the card;
+// the engine's docs say only that a reload cancels a plugin's pending clock waits (see orphanIds in book.ts). Safe
+// either way once this code is loaded: the card reads lost meanwhile, and a late answer to its spawn runs it again.
+// A hook from an older copy answers with the older code, which has no such revival.
+let spawning = new Set<string>()
 // The Agent call's effort, by its tool call id; agent.spawn does not carry it.
 let effortAsked = new Map<string, string>()
 
@@ -1214,15 +1221,30 @@ export async function sessionStart(
   next: PlainNext<'session.start'>,
 ): Promise<EventOut<'session.start'>> {
   const out = await next(e)
+  // A reload restarts the counter at zero; saved cards keep their ids, so count on from the highest.
+  seq = Math.max(seq, highestCounter(await read($, agents)))
   await $.command.register({ name: COMMAND, description: 'Show the agent board: one card per subagent' })
   await $.tool.register(TOOL_SPEC)
   $.clock.every(1000, () => {
     void tick($)
   })
   await advance($, await $.clock.now())
+  await loseOrphans($)
+  // A reload may have cut a link or a report short between its two saves; finish them now.
+  for (const r of await read($, agents)) if (r.agentId !== null) await catchUp($, r.agentId)
   const usage = await $.session.usage().catch(() => null)
   if (usage !== null) await update($, contextWindow, () => usage.context.window)
   return out
+}
+
+/** After a reload, reads lost each card whose spawn the old copy was waiting on, then drops the early reports that
+ *  leaves no card to take. */
+async function loseOrphans($: EngineInterface) {
+  const orphans = orphanIds(await read($, agents), spawning)
+  if (orphans.length === 0) return
+  const at = await $.clock.now()
+  for (const id of orphans) await update($, agents, (list) => apply(list, { id }, { kind: 'abandoned' }, at))
+  await prune($)
 }
 
 // Pushed by the engine after each turn: the window changes when the model does.
@@ -1241,10 +1263,14 @@ export async function* turnStep(
   next: StreamingNext<'turn.step'>,
 ): AsyncGenerator<Chunk<'turn.step'>, EventOut<'turn.step'>> {
   const lvl = e.effort === undefined ? null : String(e.effort)
-  await noteStep($, notes, e.agentId, e.model, lvl)
+  await noteStep($, e.agentId, e.model, lvl)
   const r = yield* next(e)
-  if (r.usage !== null && e.agentId !== undefined)
-    await noteUsage($, notes, e.agentId, `${e.turnId}:${e.index}`, r.usage)
+  // Each request is keyed, so it counts once.
+  if (r.usage !== null && e.agentId !== undefined) {
+    const { input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens } = r.usage
+    const usage = { input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens }
+    await tell($, e.agentId, { kind: 'usage', key: `${e.turnId}:${e.index}`, usage })
+  }
   return r
 }
 
@@ -1253,21 +1279,13 @@ export async function turnComplete(
   e: EventIn<'turn.complete'>,
   next: PlainNext<'turn.complete'>,
 ): Promise<EventOut<'turn.complete'>> {
-  if (e.agentId !== undefined) await agentTurnEnded($, notes, e.agentId, e.reason)
+  // A subagent's turn ending ends it; a teammate's only idles it.
+  if (e.agentId !== undefined) await tell($, e.agentId, { kind: 'ended', reason: e.reason })
   return next(e)
 }
 
-export async function agentSpawn(
-  $: EngineInterface,
-  e: EventIn<'agent.spawn'>,
-  next: PlainNext<'agent.spawn'>,
-): Promise<EventOut<'agent.spawn'>> {
-  const t = await $.clock.now()
-  seq += 1
-  const id = `${e.tool_use_id}#${seq}`
-  const asked = effortAsked.get(e.tool_use_id)
-  effortAsked.delete(e.tool_use_id)
-  const row = spawnRow(e, id, asked, await read($, effort), t)
+/** Saves a new agent's card, and starts a new batch when none was live. */
+async function startCard($: EngineInterface, row: AgentRow, t: number) {
   // Decided inside the update, so two spawns at once start one batch. Set on every run of the change.
   let isNewBatch = false
   await update($, agents, (list) => {
@@ -1282,22 +1300,57 @@ export async function agentSpawn(
     void openBoard($)
   }
   await advance($, t)
+}
 
+/** Passes the spawn on, then links the card `id` to the agent that started, or drops it if the spawn was refused. */
+async function answerSpawn(
+  $: EngineInterface,
+  e: EventIn<'agent.spawn'>,
+  next: PlainNext<'agent.spawn'>,
+  id: string,
+): Promise<EventOut<'agent.spawn'>> {
   // The row keeps the task as Claude wrote it; the agent also reads how to report its steps.
   const r = await next({ ...e, prompt: e.prompt + NUDGE })
+  const at = await $.clock.now()
   if (r.deny !== undefined) {
-    await update($, agents, (list) => list.filter((x) => x.id !== id))
+    await update($, agents, (list) => apply(list, { id }, { kind: 'refused' }, at))
+    await prune($)
     return r
   }
   const agentId = r.agentId ?? null
-  const at = await $.clock.now()
-  // Read inside the update, so a fact noted during any await before it (or during a retry) lands.
-  const before = () => (agentId === null ? undefined : notes.early.get(agentId))
-  await update($, agents, (list) =>
-    list.map((x) => (x.id === id ? settle({ ...x, agentId, model: r.model }, before(), at) : x)),
-  )
-  if (agentId !== null) notes.early.delete(agentId)
+  // The reports that came before the answer go onto the card as it links, each at the time it came. They leave the
+  // early store only once the card is saved.
+  const waiting = agentId === null ? [] : waitingFor(await read($, early), agentId)
+  const linked: Fact = { kind: 'linked', agentId, model: r.model }
+  await update($, agents, (list) => {
+    const withAgent = apply(list, { id }, linked, at)
+    return agentId === null ? withAgent : withEarly(withAgent, agentId, waiting)
+  })
+  if (waiting.length > 0) await dropApplied($)
+  // A report saved while the card was linking is taken now.
+  if (agentId !== null) await catchUp($, agentId)
+  await prune($)
   return r
+}
+
+export async function agentSpawn(
+  $: EngineInterface,
+  e: EventIn<'agent.spawn'>,
+  next: PlainNext<'agent.spawn'>,
+): Promise<EventOut<'agent.spawn'>> {
+  const t = await $.clock.now()
+  seq += 1
+  const id = `${e.tool_use_id}#${seq}`
+  const asked = effortAsked.get(e.tool_use_id)
+  effortAsked.delete(e.tool_use_id)
+  const row = newCard(e, id, asked, await read($, effort), t)
+  spawning.add(id)
+  try {
+    await startCard($, row, t)
+    return await answerSpawn($, e, next, id)
+  } finally {
+    spawning.delete(id)
+  }
 }
 
 function agentHooks(on: On) {
@@ -1312,21 +1365,26 @@ function todoHooks(on: On) {
   on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
     const r = await next(e)
     if (e.agentId !== undefined && r.deny === undefined && r.isError !== true)
-      await noteSteps($, notes, e.agentId, () => stepsFromTodos(e.todos))
+      await tell($, e.agentId, { kind: 'steps', steps: stepsFromTodos(e.todos) })
     return r
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
     const r = await next(e)
     const id = r.isError === true ? null : createdId(r.result)
-    if (e.agentId !== undefined && id !== null) await noteSteps($, notes, e.agentId, (s) => addStep(s, id, e.subject))
+    if (e.agentId !== undefined && id !== null) await tell($, e.agentId, { kind: 'stepAdded', id, title: e.subject })
     return r
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
     const r = await next(e)
     if (e.agentId !== undefined && r.deny === undefined && r.isError !== true)
-      await noteSteps($, notes, e.agentId, (s) => changeStep(s, e.taskId, { status: e.status, title: e.subject }))
+      await tell($, e.agentId, {
+        kind: 'stepChanged',
+        id: e.taskId,
+        status: e.status ?? null,
+        title: e.subject ?? null,
+      })
     return r
   }).catch(($, e, next) => next(e))
 }
@@ -1343,18 +1401,25 @@ function progressHooks(on: On) {
     const steps = stepsFromReport(e.steps)
     if (steps === null)
       return fail('Send steps as a list, each with a title and a status: pending, in_progress or completed.')
-    await noteSteps($, notes, e.agentId, () => steps)
+    await tell($, e.agentId, { kind: 'steps', steps })
     return ok('Shown on the agent board.')
   }).catch(() => fail('report_progress hit an error. Carry on with your task.'))
 }
 
 function paneHooks(on: On) {
+  // Every board button press comes here; a key that is none of the board's goes on beneath.
+  on('ui.press', {}, async ($, e, next) => {
+    if (!isOwnPress(e) || boardPressOf(e.element) === null) return next(e)
+    await press($, e.element)
+    return { element: e.element }
+  }).catch(($, e, next) => next(e))
+
   // A click while the board had the keyboard sends its own press; Tab and the arrows move the ring
   // only inside a focused board. So focus from the person onto a button of an unfocused board is a click.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
     const isClick = !isBoardFocused && e.origin.kind === 'person'
     const out = await next(e)
-    if (isClick) await pressByKey($, e.element)
+    if (isClick) await press($, e.element)
     return out
   }).catch(($, e, next) => next(e))
 
@@ -1365,7 +1430,7 @@ function paneHooks(on: On) {
     const [rows, shown, openChat, savedSections, t, window, finishedShown] = await Promise.all([
       read($, agents),
       read($, openAgent),
-      read($, chat),
+      read($, chat).then(chatOf),
       read($, sectionLog),
       read($, now),
       read($, contextWindow),
@@ -1410,8 +1475,8 @@ export const register = (on: On): void => {
   })
   on('turn.complete', {}, turnComplete).catch(($, e, next) => next(e))
   on('agent.spawn', {}, agentSpawn).catch(($, e, next) => next(e))
-  notes = makeNotes()
   seq = 0
+  spawning = new Set()
   effortAsked = new Map()
   on('command.run', { command: COMMAND }, async ($) => ({ text: await openBoard($) }))
   agentHooks(on)

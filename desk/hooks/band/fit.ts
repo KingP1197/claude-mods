@@ -1,19 +1,8 @@
 // The stats row of the band (its second line) and the button row: which figures fit the width; and how the Side question rows are cut to the rows the Band has.
 // Nothing here calls the engine.
 
-/** The drawn width, in cells, of each figure on the stats row. `cache` is null when there is no cache item yet, and `agents` when the Agent counter is not drawn. */
-export type Widths = {
-  branch: number
-  rate5: number
-  rate7: number
-  ctx: number
-  ctxShort: number
-  cache: number | null
-  agents: number | null
-}
-
-/** Which figures the stats row draws. The 5h figure and the context figure always stay. */
-export type Shown = { isBranch: boolean; isRate7: boolean; isCache: boolean; isAgents: boolean; isCtxShort: boolean }
+// Which figures the stats row draws. The 5h figure and the context figure always stay.
+type Shown = { isBranch: boolean; isRate7: boolean; isCache: boolean; isAgents: boolean; isCtxShort: boolean }
 
 /** The text between the stats row's figures. */
 export const SEP_TEXT = ' | '
@@ -31,36 +20,73 @@ const STEPS: Shown[] = [
 // What stays when even that does not fit.
 const NARROWEST: Shown = { isBranch: false, isRate7: false, isCache: false, isAgents: false, isCtxShort: true }
 
-function widthOf(s: Shown, w: Widths): number {
-  const cells = [
-    s.isBranch ? w.branch : null,
-    w.rate5,
-    s.isRate7 ? w.rate7 : null,
-    s.isCtxShort ? w.ctxShort : w.ctx,
-    s.isCache ? w.cache : null,
-    s.isAgents ? w.agents : null,
-  ].filter((c): c is number => c !== null)
-  return cells.reduce((sum, c) => sum + c, 0) + SEP * (cells.length - 1)
+/** The text of each figure on the stats row, as drawn. `cache` is null when there is no Cache item yet. */
+export type Figures<C = unknown> = {
+  branch: string
+  rate5: string
+  rate7: string
+  ctx: string
+  ctxShort: string
+  /** The Cache item's text, and `seen`: what the drawing builds the item from, carried to its row item so the drawing need not ask again whether there is one. */
+  cache: { text: string; seen: C } | null
+  agents: string
+  /** The cells a surface draws around the Agent counter's text. */
+  agentsPad: number
 }
 
-/** The column the Cache item starts at on the stats row: the figures before it, and the separator. */
-export const cacheStart = (s: Shown, w: Widths): number => widthOf({ ...s, isCache: false, isAgents: false }, w) + SEP
+/** Which figure an item of the stats row is. */
+export type RowKey = 'br' | 'r5' | 'r7' | 'ctx' | 'cache' | 'agents'
 
-/** The column the Agent counter starts at on the stats row: the figures before it, and the separator. */
-export const agentsStart = (s: Shown, w: Widths): number => widthOf({ ...s, isAgents: false }, w) + SEP
+// Which figure an item is; the Cache item also carries its `seen`.
+type Tag<C> = { key: Exclude<RowKey, 'cache'> } | { key: 'cache'; seen: C }
 
-/** Whether a terminal card of `length` cells, drawn `left` cells past an item that starts at `start`, ends inside `columns`. The engine clips what runs past the edge, so a card that does not fit is not drawn. An unknown width (0) draws it. */
-export const cardFits = (columns: number, start: number, left: number, length: number): boolean =>
-  columns <= 0 || start + left + length <= columns
+/** A figure on the stats row: which it is, its text, the cells it takes, and the column it starts at. */
+export type RowItem<C = unknown> = Tag<C> & { text: string; width: number; start: number }
 
-/** The fullest set of figures that fits `columns`. The buttons sit on a row of their own, so the stats row has the whole width. */
-export function fit(columns: number, w: Widths): Shown {
-  const step = STEPS.map((s) => ({
-    ...s,
-    isCache: s.isCache && w.cache !== null,
-    isAgents: s.isAgents && w.agents !== null,
-  })).find((s) => widthOf(s, w) <= columns)
-  return step ?? NARROWEST
+/** The figures of the stats row, left to right, the row's width in cells, and the cells the band gives it. */
+export type StatsItems<C = unknown> = { items: RowItem<C>[]; width: number; room: number }
+
+// The stats row's order, left to right. It is written here alone: what fits, what is drawn and where each card sits all read it.
+function laidOut<C>(s: Shown, f: Figures<C>, room: number): StatsItems<C> {
+  // Each figure drawn: which it is, its text, and the cells a surface draws around it. Null: not drawn.
+  const figures: ([Tag<C>, string, number] | null)[] = [
+    s.isBranch ? [{ key: 'br' }, f.branch, 0] : null,
+    [{ key: 'r5' }, f.rate5, 0],
+    s.isRate7 ? [{ key: 'r7' }, f.rate7, 0] : null,
+    [{ key: 'ctx' }, s.isCtxShort ? f.ctxShort : f.ctx, 0],
+    s.isCache && f.cache !== null ? [{ key: 'cache', seen: f.cache.seen }, f.cache.text, 0] : null,
+    s.isAgents ? [{ key: 'agents' }, f.agents, f.agentsPad] : null,
+  ]
+  const items: RowItem<C>[] = []
+  let start = 0
+  for (const figure of figures) {
+    if (figure === null) continue
+    const [tag, text, pad] = figure
+    items.push({ ...tag, text, width: text.length + pad, start })
+    start += text.length + pad + SEP
+  }
+  // 5h and context are always drawn, so the row is never empty.
+  return { items, width: start - SEP, room }
+}
+
+/**
+ * The fullest stats row that fits `columns`. The buttons sit on a row of their own, so the stats row has the whole width.
+ * An unknown width (0 or less) has room for everything: the full row and every card.
+ */
+export function statsItems<C>(columns: number, f: Figures<C>): StatsItems<C> {
+  const room = columns > 0 ? columns : Infinity
+  return STEPS.map((s) => laidOut(s, f, room)).find((row) => row.width <= room) ?? laidOut(NARROWEST, f, room)
+}
+
+/**
+ * Where a terminal card of `length` cells sits under the item `key`: its left edge, counted from the item's start, a cell past the row's end.
+ * The terminal paints later siblings over an earlier absolute Box, so a card that began just right of its item would lose its first cells to whatever the row draws after it.
+ * The engine clips what runs past the band's edge, so a card that does not fit is not drawn: null.
+ */
+export function cardLeft(row: StatsItems, key: RowKey, length: number): number | null {
+  const item = row.items.find((i) => i.key === key)
+  if (item === undefined || row.width + 1 + length > row.room) return null
+  return row.width - item.start + 1
 }
 
 /** The most rows the latest answer takes in the Band. */

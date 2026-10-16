@@ -159,17 +159,6 @@ function flatten(
 /** What the pane draws: the rows, and how many touched files the cap left out. */
 export type Tree = { rows: Row[]; hidden: number }
 
-/** The address of a row's button, which a press or a focus names back. */
-export const buttonKey = (row: Pick<Row, 'path' | 'kind'>): string => `${row.kind}:${row.path}`
-
-/** The row a button address names, or null for an address that is none of the rows'. */
-export function rowOfKey(key: string | undefined): Pick<Row, 'path' | 'kind'> | null {
-  if (key?.startsWith('dir:') === true) return { path: key.slice(4), kind: 'dir' }
-  if (key?.startsWith('file:') === true) return { path: key.slice(5), kind: 'file' }
-  if (key?.startsWith('group:') === true) return { path: key.slice(6), kind: 'group' }
-  return null
-}
-
 /** The most files the tree draws, so a drawing stays far below the engine's 100,000-character limit. */
 export const MAX_FILES = 500
 

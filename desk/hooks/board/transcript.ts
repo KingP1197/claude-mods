@@ -1,9 +1,20 @@
 // The Transcript: an agent's conversation read as entries. Nothing here calls the engine.
 import type { ApiMessage, SessionMessage, ToolUseSummary } from 'claude-code'
 
-import type { AgentRow, TranscriptLine, SentLine } from '../../types'
+import type { AgentRow, Chat, TranscriptLine, SentLine } from '../../types'
 import { NUDGE } from './agents'
 import { BAR_DONE, BAR_LIVE, ICON_INK, LINE_GUIDE } from './colors'
+
+/** The Chat of a card just opened: nothing read yet, nothing sent. */
+export const newChat = (agentId: string): Chat => ({
+  agentId,
+  lines: [],
+  isUnread: false,
+  isThinkingMissing: false,
+  dropped: 0,
+  note: null,
+  sent: 0,
+})
 
 /** A longer message is cut to this many characters, so one message cannot fill the board. */
 const LINE_CHARS = 280
@@ -179,9 +190,9 @@ const FAILED_LINES = 6
 /** What an opened Tool call draws: its input, a blank line, then as much of the end of its result as the 20 lines
  *  allow. A failed one draws only the last six lines of its output. */
 export function openedSource(l: Extract<TranscriptLine, { kind: 'tool' }>): string {
-  const output = linesOf(l.output ?? '')
+  const output = linesOf(l.output)
   if (l.isFailed) return output.slice(-FAILED_LINES).join('\n')
-  const input = linesOf(l.input ?? '')
+  const input = linesOf(l.input)
   const room = OPEN_LINES - input.length - 1
   return [...input, '', ...output.slice(-room)].join('\n')
 }
@@ -341,13 +352,6 @@ export const capped = (entries: readonly TranscriptLine[]) => ({
   lines: entries.slice(-MAX_ENTRIES),
   dropped: Math.max(0, entries.length - MAX_ENTRIES),
 })
-
-const KINDS: readonly unknown[] = ['agent', 'user', 'thought', 'tool']
-
-/** Whether a saved line is an entry. A card saved before entries had kinds holds lines without one; they read
- *  as none until the next read of the conversation replaces them. */
-export const isEntry = (l: unknown): l is TranscriptLine =>
-  typeof l === 'object' && l !== null && KINDS.includes((l as { kind?: unknown }).kind)
 
 // The timeline. Each row of the Transcript has a small gutter picture; the pictures of neighbouring rows meet at
 // their top and bottom edges, so the line runs on unbroken. All of it is `line-guide`, see-through grey.

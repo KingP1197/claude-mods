@@ -1,4 +1,5 @@
 // Editing one line of a file: plain logic; the drawing and the writing are in register.tsx.
+import { because } from '../failures'
 
 /**
  * The file split at its line breaks, and line `n`'s own ending (`\r` in a CRLF file), where the file has line `n`
@@ -40,8 +41,9 @@ export function removeLine(file: string, n: number, original: string): string | 
 /** The notice for a Save that found the line changed. */
 export const staleNotice = (n: number): string => `Line ${n} changed since you opened it. Open it again.`
 
-/** The notice for a Save the file refused: a file the user may not write, say. */
-export const failedNotice = (n: number): string => `Could not save line ${n}. The file was not changed.`
+/** The notice for a Save the file refused: a file the user may not write, say. `reason` is why. */
+export const failedNotice = (n: number, reason: string): string =>
+  `Could not save line ${n} ${because(reason)}. The file was not changed.`
 
 /** The notice as saved state holds it: some text, else none. Saved state can hold anything, and a bad value means no notice. */
 export const noticeOf = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null)

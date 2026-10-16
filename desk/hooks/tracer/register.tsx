@@ -1,10 +1,13 @@
 // The file tracer: a pane with the folder tree of the files Claude touched.
 // It opens by itself on the first Touch. Every hook lives in this file: the validator follows `$` only within one file.
 import { atom, read, update } from 'claude-code'
-import type { ElementTable, EngineInterface, On } from 'claude-code'
+import type { ElementTable, EngineInterface, On, RenderSurface } from 'claude-code'
 
-import type { EventIn, EventOut, PlainNext } from '../handler'
-import type { EditNote, LogEntry, RanEntry, SavedEntry, Tag, RecordEntry, TouchBy, TouchEntry } from '../../types'
+import { isOwnPress, takenByPressHook, type EventIn, type EventOut, type PlainNext } from '../handler'
+import { REFUSED_BY_HOOK, because, errorText, failToast } from '../failures'
+import { inputOf, svgOf } from '../surface'
+import { isAppFormOn } from './form'
+import type { EditNote, FileViewValue, LogEntry, RanEntry, Tag, RecordEntry, TouchBy, TouchEntry } from '../../types'
 import {
   fileTouchesBetween,
   headHashesNeeded,
@@ -14,24 +17,32 @@ import {
   type GitSnapshot,
   type Snapshot,
 } from './changes'
-import {
-  ACTING_SLACK,
-  editOf,
-  fitWindow,
-  jumpsOf,
-  lineKeyOf,
-  lineLabel,
-  linesOf,
-  pickedLine,
-  textOf,
-  windowOf,
-} from './acting'
+import { ACTING_SLACK, fitWindow, jumpsOf, lineLabel, lineOfferOf, linesOf, textOf, windowOf } from './acting'
+import { filesKey, filesPressOf, trailKey, trailPressOf, type FilesButton } from './keys'
+import { attempt, mcpFailure, saveFailure } from './attempt'
+import { pressAction } from './pressfailed'
 import { classify } from './classify'
 import { attachedOf, attachedWords, commentText, isUsersPrompt, withComments } from './comments'
 import { noteText, notesOf, withNote } from './notes'
 import { RAISED_FILL, SELECTED_FILL } from './colours'
 import { describe, inputFor, keptOf, keyOf, withKept, type DescribeInput, type DescriptionRequest } from './description'
 import { failedNotice, insertAfter, noticeOf, removeLine, replaceLine, staleNotice } from './edit'
+import {
+  actingFlipped,
+  actingIn,
+  boxClosed,
+  commentOpened,
+  editOpened,
+  fileClosed,
+  fileOpened,
+  fileViewOf,
+  jumpedToLine,
+  lineAdded,
+  lineDeleted,
+  linePicked,
+  saveRefused,
+  wholeFlipped,
+} from './fileview'
 import { goneNotice, openingOf } from './openrule'
 import { endCut, folderRoom, lineRoom, locationOf, middleCut, nameRoom, placeRoom, shortPath } from './paths'
 import { parentOf, reveal, systemOf } from './reveal'
@@ -39,7 +50,7 @@ import { parseStatus } from './status'
 import { drawnChars, hunksOf, named, viewOfChange, viewOfRead, type FileView } from './view'
 import { mayBeInUnlistedWorktree, parseWorktrees } from './worktrees'
 import { changedOf, summaryOf, type Summary } from './summary'
-import { COMMAND, PANE, TITLE, clearRecent, fold, isUserClose, tagWords, withDefaults, type Touch } from './record'
+import { COMMAND, PANE, TITLE, clearRecent, fold, isUserClose, tagWords, type Touch } from './record'
 import {
   MAX_TAIL,
   byText,
@@ -74,7 +85,6 @@ import { chevronSvg, folderSvg, iconSvg, typeIconOf } from './icons'
 import { LINE_ALT, LINE_HEIGHT, LINE_LETTERS, dividerSvg, lineSvg, type LineCell } from './lines'
 import {
   absoluteOf,
-  buttonKey,
   COUNT_CELLS,
   countCellsOf,
   countPair,
@@ -82,24 +92,12 @@ import {
   diffCounts,
   dividerChars,
   MAX_FILES,
-  rowOfKey,
   treeRowsOf,
   type Row,
 } from './tree'
 
 // The validator reads state only through atoms declared in this file.
-const records = atom({ plugin: 'desk', key: 'records' } as const, {} as Record<string, SavedEntry>)
-// The key an older version saved the records under. It is read, never written, and only while `records` is empty.
-const olderRecords = atom({ plugin: 'desk', key: 'trail' } as const, {} as Record<string, SavedEntry>)
-
-/** The records an older version saved stand in for the saved ones until the first write puts them under the new key. */
-const orOlder = (own: Record<string, SavedEntry>, older: Record<string, SavedEntry>) =>
-  Object.keys(own).length > 0 ? own : older
-
-/** The saved records, from the older key while the new one holds none. */
-async function savedRecords($: EngineInterface) {
-  return orOlder(await read($, records), await read($, olderRecords))
-}
+const records = atom({ plugin: 'desk', key: 'records' } as const, {} as Record<string, RecordEntry>)
 // Every Touch in session order, but the newest few, which wait in `logTail`: a write costs as much as the value it writes.
 const log = atom({ plugin: 'desk', key: 'log' } as const, [] as LogEntry[])
 // The newest entries of the Touch log, until there are enough to move into `log`.
@@ -128,26 +126,15 @@ const selected = atom({ plugin: 'desk', key: 'selected' } as const, null as stri
 // Whether the person chose `Changed only`.
 const isChangedOnly = atom({ plugin: 'desk', key: 'isChangedOnly' } as const, false)
 
-// Whether the person has opened the selected file's File view; `‹ All files` closes it.
-const isFileOpen = atom({ plugin: 'desk', key: 'isFileOpen' } as const, false)
+// The tree, or the selected file's File view with its acting form, its one box and its notice. Read it through `readFileView`.
+const fileView = atom({ plugin: 'desk', key: 'fileView' } as const, { kind: 'tree' } as FileViewValue)
 
-// Whether the open file's Changes section shows the whole file in place of its diff.
-const isWholeFile = atom({ plugin: 'desk', key: 'isWholeFile' } as const, false)
+/** The File view as saved, with the defaults filled in. */
+const readFileView = async ($: EngineInterface) => fileViewOf(await read($, fileView))
 
-// Whether the open file's whole-file text is drawn one pressable row per line (the acting form) in place of the code view.
-const isActing = atom({ plugin: 'desk', key: 'isActing' } as const, false)
-
-// The line of the acting form the person pressed last, counted from 1; null before any press.
-const selectedLine = atom({ plugin: 'desk', key: 'selectedLine' } as const, null as number | null)
-
-// The line the open Comment box belongs to; null while no box is open.
-const commentLine = atom({ plugin: 'desk', key: 'commentLine' } as const, null as number | null)
-
-// The line the open Edit box belongs to and the text it was opened with; null while no Edit box is open.
-const editBox = atom({ plugin: 'desk', key: 'editBox' } as const, null as { line: number; original: string } | null)
-
-// The notice a refused Save left under the selected line; null while there is none.
-const notice = atom({ plugin: 'desk', key: 'notice' } as const, null as string | null)
+/** Writes the File view once, as `move` makes it from the saved one. */
+const moveFileView = ($: EngineInterface, move: (view: FileViewValue) => FileViewValue) =>
+  update($, fileView, (saved) => move(fileViewOf(saved)))
 
 // The notice a failed Open in Files left under the buttons of the File view; null while there is none.
 const filesNotice = atom({ plugin: 'desk', key: 'filesNotice' } as const, null as string | null)
@@ -220,16 +207,10 @@ const selectFile = ($: EngineInterface, path: string) => update($, selected, () 
 
 /** A click on a file row: reads the file for the view area, then selects it. `path` is absolute. */
 async function clickFile($: EngineInterface, path: string) {
-  shown = await showFile($, path, withDefaults(await savedRecords($)))
+  shown = await showFile($, path, await read($, records))
+  forgetTyped()
   // Together, not one after another: the Description's request waits behind these, and a test counts the engine's turns until it is out.
-  await Promise.all([
-    update($, isWholeFile, () => false),
-    update($, isActing, () => false),
-    update($, selectedLine, () => null),
-    update($, filesNotice, () => null),
-    closeBox($),
-  ])
-  await update($, isFileOpen, () => true)
+  await Promise.all([update($, filesNotice, () => null), moveFileView($, fileOpened)])
   await update($, selected, () => path)
   await describeShown($)
 }
@@ -271,7 +252,7 @@ async function clickFolder($: EngineInterface, path: string, abs: string) {
 
 /** Asks git for the worktrees again when a Touch lands in a path new to the records that may sit in one it has not listed. */
 async function relistWorktreesFor($: EngineInterface, touches: Touch[]) {
-  const [saved, cwd] = [await savedRecords($), await $.session.cwd()]
+  const [saved, cwd] = [await read($, records), await $.session.cwd()]
   const roots = await knownWorktrees($)
   const isNew = touches.some((t) => saved[t.path] === undefined && mayBeInUnlistedWorktree(t.path, cwd, roots))
   if (isNew) await listWorktrees($)
@@ -282,30 +263,31 @@ const clickGroup = ($: EngineInterface, name: string) =>
   update($, closedGroups, (c) => (c.includes(name) ? c.filter((g) => g !== name) : [...c, name]))
 
 /** The address of the toggle that shows every touched file or only the changed ones. */
-const CHANGED_ONLY_KEY = 'changed-only'
+const CHANGED_ONLY_KEY = filesKey({ kind: 'button', name: 'changed-only' })
 
 /** The address of the `Trail` button. */
-const TRAIL_KEY = 'show-trail'
+const TRAIL_KEY = filesKey({ kind: 'button', name: 'show-trail' })
 
 /** Closes the Turn if it is open in the Trail, opens it if closed. */
 const toggleTurn = ($: EngineInterface, n: number) =>
   update($, closedTurns, (c) => (c.includes(n) ? c.filter((x) => x !== n) : [...c, n]))
 
 /** The address of the Trail's `Show Claude only` toggle. */
-const CLAUDE_ONLY_KEY = 'claude-only'
+const CLAUDE_ONLY_KEY = trailKey({ kind: 'claudeOnly' })
 
 /** Flips the Trail between `Show Claude only` and `Show all`. */
 const toggleClaudeOnly = ($: EngineInterface) => update($, isClaudeOnly, (c) => c !== true)
 
-/** A press on a Touch in the Trail: its file is selected in the Files pane, the Files pane is opened with the keyboard if it was closed, and the Touch is the Trail's selected one. The terminal opens the File view on the file; the App form runs the Open rule on its current path instead. */
-async function pressTouch($: EngineInterface, t: TouchEntry, isApp: boolean) {
-  const path = currentPath(await readLog($), t)
-  if (isApp) await Promise.all([selectFile($, path), update($, filesNotice, () => null)])
-  else await clickFile($, path)
-  await update($, trailSelected, () => t.n)
-  await update($, closed, () => false)
-  await $.ui.open({ id: PANE, title: TITLE, focus: true }).catch(() => null)
-  if (isApp) await openRule($, path)
+/** A press on a Touch in the Trail: its file is selected in the Files pane, the Files pane is opened with the keyboard if it was closed, and the Touch is the Trail's selected one. The terminal opens the File view on the file; the App form runs the Open rule on its current path instead. A Files pane that cannot be opened fails the press, which `reported` tells the user, as Show Trail does; in the App form the Open rule has run by then, so the app's own pane still opens. `n` is the Touch's number: the Touch is read from the log when pressed. */
+async function pressTouch($: EngineInterface, n: number, surface: RenderSurface) {
+  const log = await readLog($)
+  const t = log.find((x) => x.type === 'touch' && x.n === n)
+  if (t?.type !== 'touch') return
+  await pressFile($, currentPath(log, t), surface, async () => {
+    await update($, trailSelected, () => n)
+    await update($, closed, () => false)
+    await $.ui.open({ id: PANE, title: TITLE, focus: true })
+  })
 }
 
 /** Opens the Trail pane, beside Files. */
@@ -315,25 +297,25 @@ const openTrail = ($: EngineInterface) => $.ui.open({ id: TRAIL_PANE, title: TRA
 const toggleChangedOnly = ($: EngineInterface) => update($, isChangedOnly, (c) => c !== true)
 
 /** The address of the `‹ All files` button. */
-const BACK_KEY = 'back'
+const BACK_KEY = filesKey({ kind: 'button', name: 'back' })
 
 /** Closes the File view: the tree comes back with the same row selected. */
-const closeFile = ($: EngineInterface) => update($, isFileOpen, () => false)
+const closeFile = ($: EngineInterface) => moveFileView($, fileClosed)
 
 /** The address of the button that switches the Changes section between the diff and the whole file. */
-const WHOLE_KEY = 'whole'
+const WHOLE_KEY = filesKey({ kind: 'button', name: 'whole' })
 
 /** Flips the Changes section between the diff and the whole file. */
-const toggleWholeFile = ($: EngineInterface) => update($, isWholeFile, (c) => c !== true)
+const toggleWholeFile = ($: EngineInterface) => moveFileView($, wholeFlipped)
 
 /** The address of the button that switches the whole-file text between the code view and the acting form. */
-const ACTING_KEY = 'acting'
+const ACTING_KEY = filesKey({ kind: 'button', name: 'acting' })
 
 /** Flips the whole-file text between the code view and the acting form. */
-const toggleActing = ($: EngineInterface) => update($, isActing, (c) => c !== true)
+const toggleActing = ($: EngineInterface) => moveFileView($, actingFlipped)
 
 /** The address of the `Discard` button beside the line counting the attached comments. */
-const DISCARD_KEY = 'discard'
+const DISCARD_KEY = filesKey({ kind: 'button', name: 'discard' })
 
 /** The line counting the comments attached to the next message, with the button that drops them; null while none are attached. */
 function attachedRow($: EngineInterface, els: ElementTable, count: number) {
@@ -342,7 +324,7 @@ function attachedRow($: EngineInterface, els: ElementTable, count: number) {
   return (
     <Box key="attached" flexDirection="row" gap={1}>
       <Text color={GREY}>{attachedWords(count)}</Text>
-      <Button key={DISCARD_KEY} onPress={() => discardComments($)}>
+      <Button key={DISCARD_KEY} onPress={takenByPressHook}>
         Discard
       </Button>
     </Box>
@@ -350,11 +332,11 @@ function attachedRow($: EngineInterface, els: ElementTable, count: number) {
 }
 
 /** The address of the `Comment` button, and of the box and buttons that replace it. */
-const COMMENT_KEY = 'comment'
+const COMMENT_KEY = filesKey({ kind: 'button', name: 'comment' })
 const COMMENT_INPUT_KEY = 'comment-input'
-const SEND_KEY = 'send'
-const ATTACH_KEY = 'attach'
-const CANCEL_KEY = 'cancel'
+const SEND_KEY = filesKey({ kind: 'button', name: 'send' })
+const ATTACH_KEY = filesKey({ kind: 'button', name: 'attach' })
+const CANCEL_KEY = filesKey({ kind: 'button', name: 'cancel' })
 
 /** What the person has typed in the Comment box so far. It is kept here, not in saved state: the field holds it, and a reload of the mod starts a blank box. */
 let draft = ''
@@ -362,108 +344,118 @@ let draft = ''
 /** What the person has typed in the Edit box so far; null before any typing, when the box shows the line it was opened with. A reload of the mod starts it null, so a box kept in saved state holds its line again and not an empty field. */
 let typed: string | null = null
 
+/** Forgets what was typed in the Comment box and the Edit box. */
+function forgetTyped() {
+  draft = ''
+  typed = null
+}
+
 /** Opens the Comment box under the selected line. */
 async function openComment($: EngineInterface) {
-  const n = pickedLine(await read($, selectedLine))
-  draft = ''
-  if (n !== null) await update($, commentLine, () => n)
+  forgetTyped()
+  await moveFileView($, commentOpened)
 }
 
 /** Opens the Edit box under the selected line, holding the line's text as the pane shows it. */
 async function openEdit($: EngineInterface) {
-  const n = pickedLine(await read($, selectedLine))
+  const n = actingIn(await readFileView($))?.line ?? null
   const text = shown === null ? null : textOf(shown.view ?? { note: '' }, shown.whole)
   const original = n === null || text === null ? undefined : linesOf(text)[n - 1]
-  if (n === null || original === undefined) return
-  await update($, commentLine, () => null)
-  typed = null
-  await update($, editBox, () => ({ line: n, original }))
+  if (original === undefined) return
+  forgetTyped()
+  await moveFileView($, (view) => editOpened(view, original))
+}
+
+/** The open Edit box: the line it belongs to and the text it was opened with; null while no Edit box is open. */
+async function editBoxOf($: EngineInterface): Promise<{ line: number; original: string } | null> {
+  const acting = actingIn(await readFileView($))
+  const box = acting?.box
+  return acting?.line == null || box?.kind !== 'edit' ? null : { line: acting.line, original: box.original }
 }
 
 /** The new text of a file, made from the text the file has now; null where the box's line is no longer what it was opened with. */
 type Change = (file: string) => string | null
 
+/** What the File view becomes once a change is written, from the view and the text written. */
+type Written = (view: FileViewValue, text: string) => FileViewValue
+
+/**
+ * Reads the file and writes what `change` makes of it. `wrote` is the text written, null where nothing was; `failure`
+ * is why, where the read or the write failed.
+ */
+async function tryChange($: EngineInterface, path: string, change: Change) {
+  const readIt = await attempt($.fs.read(path))
+  const file = readIt.ok ? readIt.value : null
+  const next = file === null ? null : change(file)
+  forgetTyped()
+  const writeIt = next === null ? null : await attempt($.fs.write(path, next))
+  return { file, next, wrote: writeIt?.ok === true ? next : null, failure: saveFailure(readIt, writeIt) }
+}
+
 /**
  * Writes the file the change makes, unless the file's line is no longer the one the box was opened with: then it
- * writes nothing, reads the file again for the pane and says so. A write the file refuses says so too. The text it wrote; null where it wrote nothing.
+ * writes nothing, reads the file again for the pane and says so. A write the file refuses says so too. Either way the
+ * box closes and the File view is written once: as `written` makes it, or with the notice.
  */
 async function changeFile(
   $: EngineInterface,
   line: number,
   change: Change,
-  note?: Omit<EditNote, 'path'>,
-): Promise<string | null> {
+  written: Written,
+  note: Omit<EditNote, 'path'>,
+) {
   const path = await read($, selected)
-  if (path === null) return null
-  const file = await $.fs.read(path).catch(() => null)
-  const next = file === null ? null : change(file)
-  await closeBox($)
-  const isWritten =
-    next !== null &&
-    (await $.fs.write(path, next).then(
-      () => true,
-      () => false,
-    ))
-  if (isWritten) {
-    await recordUserEdit($, path, { before: file ?? '', after: next })
+  if (path === null) return
+  const { file, next, wrote, failure } = await tryChange($, path, change)
+  if (wrote !== null) {
+    await recordUserEdit($, path, { before: file ?? '', after: wrote })
     const cwd = await $.session.cwd()
-    if (note !== undefined)
-      await update($, notes, (own) => withNote(notesOf(own), { ...note, path: named(cwd, absoluteOf(cwd, path)) }))
+    await update($, notes, (own) => withNote(notesOf(own), { ...note, path: named(cwd, absoluteOf(cwd, path)) }))
   }
-  shown = await showFile($, path, withDefaults(await savedRecords($)))
-  if (isWritten) await describeShown($)
-  else await update($, notice, () => (file !== null && next === null ? staleNotice(line) : failedNotice(line)))
-  return isWritten ? next : null
+  shown = await showFile($, path, await read($, records))
+  const said = file !== null && next === null ? staleNotice(line) : failedNotice(line, failure)
+  await moveFileView($, (view) => (wrote === null ? saveRefused(view, said) : written(view, wrote)))
+  if (wrote !== null) await describeShown($)
 }
 
 /** Writes the typed line over the line the Edit box was opened on. */
 async function saveEdit($: EngineInterface, typedWords: string | null) {
-  const box = editOf(await read($, editBox))
+  const box = await editBoxOf($)
   if (box === null) return
   const words = typedWords ?? box.original
   if (words === box.original) return closeBox($)
   const note = { line: box.line, kind: 'changed', was: box.original, now: words } as const
-  await changeFile($, box.line, (file) => replaceLine(file, box.line, box.original, words), note)
+  await changeFile($, box.line, (file) => replaceLine(file, box.line, box.original, words), boxClosed, note)
 }
 
 /** Writes the file without the line the Edit box was opened on. */
 async function deleteLine($: EngineInterface) {
-  const box = editOf(await read($, editBox))
+  const box = await editBoxOf($)
   if (box === null) return
   const note = { line: box.line, kind: 'deleted', was: box.original, now: '' } as const
-  const next = await changeFile($, box.line, (file) => removeLine(file, box.line, box.original), note)
-  if (next === null) return
-  // With the last line gone, the one above it is selected, so Comment and Edit keep a line to draw under.
-  const last = linesOf(next).length
-  if (box.line > last) await update($, selectedLine, () => (last < 1 ? null : last))
+  const deleted: Written = (view, text) => lineDeleted(view, linesOf(text).length)
+  await changeFile($, box.line, (file) => removeLine(file, box.line, box.original), deleted, note)
 }
 
 /** Writes a blank line after the line the Edit box was opened on, and opens the box on it. */
 async function addLine($: EngineInterface) {
-  const box = editOf(await read($, editBox))
+  const box = await editBoxOf($)
   if (box === null) return
   const note = { line: box.line + 1, kind: 'added', was: '', now: '' } as const
-  if ((await changeFile($, box.line, (file) => insertAfter(file, box.line, box.original), note)) === null) return
-  await update($, selectedLine, () => box.line + 1)
-  await update($, editBox, () => ({ line: box.line + 1, original: '' }))
+  await changeFile($, box.line, (file) => insertAfter(file, box.line, box.original), lineAdded, note)
 }
 
 /** Closes the Comment box and the Edit box, and forgets what was typed in them. */
 async function closeBox($: EngineInterface) {
-  draft = ''
-  typed = null
-  // Only a box that is open is written to, and both together: a click on a file waits on this before it asks for the Description, and every write costs turns.
-  const [comment, edit, said] = await Promise.all([read($, commentLine), read($, editBox), read($, notice)])
-  await Promise.all([
-    comment === null ? null : update($, commentLine, () => null),
-    edit === null ? null : update($, editBox, () => null),
-    said === null ? null : update($, notice, () => null),
-  ])
+  forgetTyped()
+  // Only an open box or a notice is written away: the keyboard leaving the pane closes the box each time, and every write redraws.
+  const acting = actingIn(await readFileView($))
+  if (acting?.box != null || acting?.notice != null) await moveFileView($, boxClosed)
 }
 
 /** The comment on the selected line, as Claude reads it; null where no line of a shown file is selected. */
 async function commentOnSelected($: EngineInterface, words: string): Promise<string | null> {
-  const [path, n] = [await read($, selected), pickedLine(await read($, selectedLine))]
+  const [path, n] = [await read($, selected), actingIn(await readFileView($))?.line ?? null]
   const text = shown === null ? null : textOf(shown.view ?? { note: '' }, shown.whole)
   if (path === null || n === null || text === null) return null
   const line = linesOf(text)[n - 1]
@@ -491,25 +483,24 @@ async function sendComment($: EngineInterface, words: string) {
   const text = await commentOnSelected($, words)
   if (text === null) return closeBox($)
   const failure = await $.prompt.submit({ text, asUser: true }).then(
-    (r) => (r.drop === undefined ? null : 'was refused'),
-    () => 'could not be sent',
+    (r) => (r.drop === undefined ? null : `The comment was refused ${because(r.drop || REFUSED_BY_HOOK)}.`),
+    (err: unknown) => `The comment could not be sent ${because(errorText(err))}.`,
   )
   if (failure === null) await closeBox($)
-  else $.ui.toast(`The comment ${failure}.`)
+  else $.ui.toast(failure)
+}
+
+/** Moves the File view to the line `move` selects. A box that closes forgets what was typed in it; a box that stays keeps it. */
+async function moveToLine($: EngineInterface, move: (view: FileViewValue) => FileViewValue) {
+  if (actingIn(move(await readFileView($)))?.box == null) forgetTyped()
+  await moveFileView($, move)
 }
 
 /** Selects a line of the acting form: `Comment` and `Edit` are drawn under it. A Comment or Edit box open on another line closes. */
-async function pickLine($: EngineInterface, n: number) {
-  const open = (await read($, commentLine)) ?? editOf(await read($, editBox))?.line ?? null
-  if (open !== n) await closeBox($)
-  await update($, selectedLine, () => n)
-}
+const pickLine = ($: EngineInterface, n: number) => moveToLine($, (view) => linePicked(view, n))
 
-/** Switches the whole-file text to the acting form with a line selected: what a press on a `Line N` button under Changes does. */
-async function jumpToLine($: EngineInterface, n: number) {
-  await pickLine($, n)
-  await update($, isActing, () => true)
-}
+/** Switches the whole-file text to the acting form with a line selected: what a press on a `Line N` button under Changes does. A box kept while Read only on that line comes back. */
+const jumpToLine = ($: EngineInterface, n: number) => moveToLine($, (view) => jumpedToLine(view, n))
 
 /** Opens the pane at the default size; the engine keeps a size the person dragged. */
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: TITLE })
@@ -550,12 +541,10 @@ async function recordAll(
   await relistWorktreesFor($, touches)
   let isFirst = false
   let prior: Record<string, RecordEntry> = {}
-  const older = await read($, olderRecords)
   await update($, records, (own) => {
-    const t = orOlder(own, older)
-    isFirst = Object.keys(t).length === 0
-    prior = withDefaults(t)
-    return touches.reduce(fold, withDefaults(t))
+    isFirst = Object.keys(own).length === 0
+    prior = own
+    return touches.reduce(fold, own)
   })
   const turn = currentTurn(await read($, turns))
   const ran =
@@ -584,9 +573,8 @@ async function recordAll(
 
 /** Records the user's saved edit of a file: the file's record takes the Tag `Edited by you` and the new text, and the log gains a Touch made by the user with the lines it added and removed. */
 async function recordUserEdit($: EngineInterface, path: string, text: { before: string; after: string }) {
-  const older = await read($, olderRecords)
   await update($, records, (own) =>
-    fold(withDefaults(orOlder(own, older)), { path, tag: 'Edited', baseline: null, seen: text.after, isByUser: true }),
+    fold(own, { path, tag: 'Edited', baseline: null, seen: text.after, isByUser: true }),
   )
   const turn = currentTurn(await read($, turns))
   await appendToLog($, [
@@ -595,15 +583,27 @@ async function recordUserEdit($: EngineInterface, path: string, text: { before: 
 }
 
 /** The address of the Reveal button, which a press or a focus names back. */
-const REVEAL_KEY = 'reveal'
+const REVEAL_KEY = filesKey({ kind: 'button', name: 'reveal' })
 
 /** The address of the Open in Files button. */
-const OPEN_FILES_KEY = 'openFiles'
+const OPEN_FILES_KEY = filesKey({ kind: 'button', name: 'openFiles' })
 
-/** The actions of the pane's buttons that are not rows, by address. */
-const buttonActions = ($: EngineInterface): Record<string, () => Promise<unknown>> => ({
+/**
+ * Runs the action of a press. One that fails tells the user: the press hook's `.catch` would otherwise answer for the
+ * throw, leave the pane as it was and say nothing.
+ */
+async function reported($: EngineInterface, doing: string, action: () => Promise<unknown>) {
+  try {
+    await action()
+  } catch (err) {
+    $.ui.toast(failToast(doing, errorText(err)))
+  }
+}
+
+/** The action of each named button of the Files pane: the one copy, which `press` runs for a click and a first click alike. */
+const buttonActions = ($: EngineInterface, surface: RenderSurface): Record<FilesButton, () => Promise<unknown>> => ({
   [REVEAL_KEY]: () => revealSelected($),
-  [OPEN_FILES_KEY]: () => openInFiles($),
+  [OPEN_FILES_KEY]: () => openInFiles($, surface),
   [CHANGED_ONLY_KEY]: () => toggleChangedOnly($),
   [TRAIL_KEY]: () => openTrail($),
   [WHOLE_KEY]: () => toggleWholeFile($),
@@ -620,30 +620,53 @@ const buttonActions = ($: EngineInterface): Record<string, () => Promise<unknown
   [BACK_KEY]: () => closeFile($),
 })
 
-/** Runs the action of the row button a first click on the unfocused pane landed on, as its onPress would. */
-async function pressByKey($: EngineInterface, key: string | undefined) {
-  const actions = buttonActions($)
-  if (key !== undefined && Object.hasOwn(actions, key)) return actions[key]?.()
-  const at = lineKeyOf(key)
-  if (at !== null) return at.kind === 'jump' ? jumpToLine($, at.n) : pickLine($, at.n)
-  const row = rowOfKey(key)
-  if (row === null) return
-  if (row.kind === 'group') return clickGroup($, row.path)
-  const abs = absoluteOf(await $.session.cwd(), row.path)
-  if (row.kind === 'dir') return clickFolder($, row.path, abs)
-  return (await isInApp($)) ? pressAppFile($, abs) : clickFile($, abs)
+/**
+ * Runs the press a Files pane key names. The tracer's `ui.press` hook and a first click on the unfocused pane both call
+ * it, so each action is written once, and what it needs (the typed text, whether the app draws the session) is read
+ * when pressed, not when drawn. `surface` is where the press came from.
+ */
+const press = ($: EngineInterface, key: string | undefined, surface: RenderSurface) =>
+  reported($, pressAction(key), () => filesAction($, key, surface))
+
+/** The action a Files pane key names. */
+async function filesAction($: EngineInterface, key: string | undefined, surface: RenderSurface) {
+  const p = filesPressOf(key)
+  if (p === null) return
+  if (p.kind === 'button') return buttonActions($, surface)[p.name]()
+  if (p.kind === 'line') return pickLine($, p.n)
+  if (p.kind === 'jump') return jumpToLine($, p.n)
+  if (p.kind === 'group') return clickGroup($, p.path)
+  const abs = absoluteOf(await $.session.cwd(), p.path)
+  return p.kind === 'dir' ? clickFolder($, p.path, abs) : pressFile($, abs, surface)
 }
+
+/** The address of a tree row's button. */
+const rowKey = (r: Pick<Row, 'kind' | 'path'>) => filesKey({ kind: r.kind, path: r.path })
+
+/** The address of a line row's button in the acting form. */
+const lineKey = (n: number) => filesKey({ kind: 'line', n })
+
+/** The address of a `Line N` button under Changes. */
+const jumpKey = (n: number) => filesKey({ kind: 'jump', n })
 
 /** Who made a Touch: Claude's own loop (no agent id) or the helper whose loop raised the call. */
 const madeBy = (agentId: string | undefined): TouchBy =>
   agentId === undefined ? { kind: 'claude' } : { kind: 'helper', id: agentId }
 
 /**
- * Whether the desktop app draws this session, where the mod takes its App form: it records, runs git and opens the
- * pane as in the terminal, and draws the tree and the Trail without the File view. The roster is read per event,
- * not once at start, because the app attaches after the session starts.
+ * The surface a first click replayed through `ui.focus` counts as coming from. The focus event names no surface, and
+ * the desktop app is the surface that spends a first click on focusing the pane; with the app attached, the replay
+ * takes the App form, as every press did before the form was picked per surface. The limit: should a terminal ever
+ * send a person's focus onto an unfocused pane, that replay would follow the Open rule too, not open the File view.
  */
-const isInApp = async ($: EngineInterface) => (await $.session.surfaces()).includes('desktop')
+const REPLAY_SURFACE = 'desktop'
+
+/**
+ * Whether a drawing or a press on `surface` takes the App form: the tree and the Trail without the File view. Where
+ * the desktop app is attached the mod still records, runs git and opens the pane as in the terminal. The roster is
+ * read per event, not once at start, because the app attaches after the session starts.
+ */
+const isAppOn = async ($: EngineInterface, surface: RenderSurface) => isAppFormOn(surface, await $.session.surfaces())
 
 function toolHooks(on: On) {
   on('tool.call', async ($, e, next) => {
@@ -807,7 +830,7 @@ async function touchesSince($: EngineInterface, before: Snapshot): Promise<Touch
   if (after?.kind !== 'git') return []
   const vanished = await vanishedSince($, before, after)
   const heads = await headHashesOf($, after.root, headHashesNeeded(before, after, vanished))
-  const saved = withDefaults(await savedRecords($))
+  const saved = await read($, records)
   const found = touchesBetween(before, after, vanished, heads)
   // A file the records hold no baseline for, clean before the command: HEAD holds the text it had at the session's start.
   // A moved file whose old place the records hold a baseline for needs none: the records carry that one over.
@@ -897,8 +920,7 @@ export async function promptSubmit(
   e: EventIn<'prompt.submit'>,
   next: PlainNext<'prompt.submit'>,
 ): Promise<EventOut<'prompt.submit'>> {
-  const older = await read($, olderRecords)
-  await update($, records, (own) => clearRecent(withDefaults(orOlder(own, older))))
+  await update($, records, (own) => clearRecent(own))
   const logged = await readLog($)
   await update($, turns, (own) => startTurn(own, logged, e.text))
   // The comments the person attached ride on their next prompt, then none is left.
@@ -976,12 +998,12 @@ const COLOR: Partial<Record<Tag, string>> = {
  */
 function groupRow($: EngineInterface, els: ElementTable, look: Look, r: Row) {
   const { Box, Text, Button } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   return (
     <Box key={`section:${r.path}`} flexDirection="row" gap={1}>
       <Text> </Text>
       {Svg === null ? (
-        <Button key={buttonKey(r)} plain onPress={() => clickGroup($, r.path)}>
+        <Button key={rowKey(r)} plain onPress={takenByPressHook}>
           {r.isOpen ? '▾' : '▸'}
         </Button>
       ) : (
@@ -995,7 +1017,7 @@ function groupRow($: EngineInterface, els: ElementTable, look: Look, r: Row) {
             {r.name}
           </Text>
         ) : (
-          <Button key={buttonKey(r)} plain onPress={() => clickGroup($, r.path)}>
+          <Button key={rowKey(r)} plain onPress={takenByPressHook}>
             <Text bold>{r.name}</Text>
           </Button>
         )}
@@ -1027,7 +1049,7 @@ const lineWidth = (r: Row) => r.lines.length * 2
 /** The tree lines of a row, one two-cell box per level: a picture on the desktop, `├─`, `│` or `└─` in the terminal; none for a row at the top. They sit inside the chevron's cell, so the last of them falls in the column of its folder's chevron. */
 function lineCells(els: ElementTable, look: Look, r: Row) {
   const { Box, Text } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   if (r.lines.length === 0) return null
   const cellView = (cell: LineCell) => {
     if (Svg === null) return <Text color="subtle">{LINE_LETTERS[cell]}</Text>
@@ -1048,7 +1070,7 @@ function lineCells(els: ElementTable, look: Look, r: Row) {
 /** A folder row: the marker, the chevron, on the desktop the folder icon, then the name as the only clickable part; in the terminal the chevron is `▸` or `▾` and the name ends in a slash. */
 function dirRow($: EngineInterface, els: ElementTable, selectedPath: string | null, look: Look, r: Row) {
   const { Box, Text, Button } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   const isSelected = r.abs === selectedPath
   const label = endCut(Svg === null ? `${r.name}/` : r.name, folderRoom(look.columns, r.lines.length, Svg !== null))
   return (
@@ -1068,7 +1090,7 @@ function dirRow($: EngineInterface, els: ElementTable, selectedPath: string | nu
         </Box>
       )}
       <Box key={`name:${r.path}`} flexShrink={1}>
-        <Button key={buttonKey(r)} plain onPress={() => clickFolder($, r.path, r.abs)}>
+        <Button key={rowKey(r)} plain onPress={takenByPressHook}>
           {isSelected ? <Text bold>{label}</Text> : label}
         </Button>
       </Box>
@@ -1132,7 +1154,7 @@ function countCells(els: ElementTable, r: Row) {
 function fileRow($: EngineInterface, els: ElementTable, selectedPath: string | null, look: Look, r: Row) {
   const { Box, Button } = els
   const icon = typeIconOf(r.name)
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   const isSelected = r.abs === selectedPath
   return (
     <Box key={`row:${r.path}`} flexDirection="row" gap={1} {...fillOf(isSelected, look)}>
@@ -1148,12 +1170,7 @@ function fileRow($: EngineInterface, els: ElementTable, selectedPath: string | n
         )}
       </Box>
       <Box key={`name:${r.path}`} flexShrink={1}>
-        <Button
-          key={buttonKey(r)}
-          plain
-          dimColor={r.tag === 'Read'}
-          onPress={() => (look.isApp ? pressAppFile($, r.abs) : clickFile($, r.abs))}
-        >
+        <Button key={rowKey(r)} plain dimColor={r.tag === 'Read'} onPress={takenByPressHook}>
           {nameText(els, look, r, isSelected)}
         </Button>
       </Box>
@@ -1164,19 +1181,15 @@ function fileRow($: EngineInterface, els: ElementTable, selectedPath: string | n
   )
 }
 
-/** The Svg element, or null where this surface draws no pictures: the terminal's table offers one that draws nothing. */
-const svgOf = (els: ElementTable, look: Look) =>
-  look.isDesktop && 'Svg' in els && els.Svg !== undefined ? els.Svg : null
-
-/** What a row's drawing depends on beyond the row: the pane's width in cells, whether the surface draws pictures, and whether the Files pane is in its App form (set by that pane's render only; a press there selects the row, with no File view). */
-type Look = { columns: number; isDesktop: boolean; isMobile: boolean; isApp: boolean }
+/** What a row's drawing depends on beyond the row: the pane's width in cells, the surface it is on, whether that surface draws pictures, and whether the Files pane is in its App form (set by that pane's render only; a press there selects the row, with no File view). */
+type Look = { columns: number; surface: RenderSurface; isDesktop: boolean; isApp: boolean }
 
 /** How a pane is drawn, for the Files pane and the Trail alike: its width, the surface it is on and whether that is the desktop app's App form. */
-const lookOf = async ($: EngineInterface, surface: string, columns: number): Promise<Look> => ({
+const lookOf = async ($: EngineInterface, surface: RenderSurface, columns: number): Promise<Look> => ({
   columns,
+  surface,
   isDesktop: surface !== 'terminal',
-  isMobile: surface === 'mobile',
-  isApp: await isInApp($),
+  isApp: await isAppOn($, surface),
 })
 
 /**
@@ -1260,11 +1273,12 @@ const NO_FIELD_NOTICE = 'Type comments in the desktop app or the terminal.'
 function commentBox($: EngineInterface, els: ElementTable, look: Look) {
   const { Box, Text, Button } = els
   const cancel = (
-    <Button key={CANCEL_KEY} dimColor onPress={() => closeBox($)}>
+    <Button key={CANCEL_KEY} dimColor onPress={takenByPressHook}>
       Cancel
     </Button>
   )
-  if (look.isMobile || !('Input' in els) || els.Input === undefined) {
+  const Input = inputOf(look.surface, els)
+  if (Input === null) {
     return (
       <Box key="commentBox" flexDirection="column">
         <Text color={GREY}>{NO_FIELD_NOTICE}</Text>
@@ -1274,7 +1288,7 @@ function commentBox($: EngineInterface, els: ElementTable, look: Look) {
   }
   return (
     <Box key="commentBox" flexDirection="column">
-      <els.Input
+      <Input
         key={COMMENT_INPUT_KEY}
         placeholder="Comment on this line"
         onInput={(value) => {
@@ -1284,10 +1298,10 @@ function commentBox($: EngineInterface, els: ElementTable, look: Look) {
         onSubmit={(value) => sendComment($, value)}
       />
       <Box key="commentButtons" flexDirection="row" gap={1}>
-        <Button key={SEND_KEY} onPress={() => sendComment($, draft)}>
+        <Button key={SEND_KEY} onPress={takenByPressHook}>
           Send
         </Button>
-        <Button key={ATTACH_KEY} onPress={() => attachComment($, draft)}>
+        <Button key={ATTACH_KEY} onPress={takenByPressHook}>
           Attach
         </Button>
         {cancel}
@@ -1297,11 +1311,11 @@ function commentBox($: EngineInterface, els: ElementTable, look: Look) {
 }
 
 /** The address of the Edit box's field and of its buttons. */
-const EDIT_KEY = 'edit'
+const EDIT_KEY = filesKey({ kind: 'button', name: 'edit' })
 const EDIT_INPUT_KEY = 'edit-input'
-const SAVE_KEY = 'save'
-const ADD_KEY = 'add'
-const DELETE_KEY = 'delete'
+const SAVE_KEY = filesKey({ kind: 'button', name: 'save' })
+const ADD_KEY = filesKey({ kind: 'button', name: 'add' })
+const DELETE_KEY = filesKey({ kind: 'button', name: 'delete' })
 
 /** The Edit box under the selected line: the one-line field holding the line, then `Save`, `+`, `×` and `Cancel`. */
 function editBoxView($: EngineInterface, els: ElementTable, original: string) {
@@ -1318,16 +1332,16 @@ function editBoxView($: EngineInterface, els: ElementTable, original: string) {
         onSubmit={(value) => saveEdit($, value)}
       />
       <Box key="editButtons" flexDirection="row" gap={1}>
-        <Button key={SAVE_KEY} onPress={() => saveEdit($, typed)}>
+        <Button key={SAVE_KEY} onPress={takenByPressHook}>
           Save
         </Button>
-        <Button key={ADD_KEY} onPress={() => addLine($)}>
+        <Button key={ADD_KEY} onPress={takenByPressHook}>
           +
         </Button>
-        <Button key={DELETE_KEY} onPress={() => deleteLine($)}>
+        <Button key={DELETE_KEY} onPress={takenByPressHook}>
           ×
         </Button>
-        <Button key={CANCEL_KEY} dimColor onPress={() => closeBox($)}>
+        <Button key={CANCEL_KEY} dimColor onPress={takenByPressHook}>
           Cancel
         </Button>
       </Box>
@@ -1343,21 +1357,21 @@ function lineActions(
   under: { box: 'comment' | 'edit' | null; said: string | null; original: string },
 ) {
   const { Box, Text, Button } = els
-  if (under.box === 'comment') return commentBox($, els, look)
-  // The phone edits nothing, so an Edit box left in saved state draws as the line's own buttons.
-  if (under.box === 'edit' && !look.isMobile) return editBoxView($, els, under.original)
+  const offer = lineOfferOf({ box: under.box, hasField: inputOf(look.surface, els) !== null })
+  if (offer.kind === 'commentBox') return commentBox($, els, look)
+  if (offer.kind === 'editBox') return editBoxView($, els, under.original)
   return (
     <Box key="lineActions" flexDirection="column">
       {under.said === null ? null : <Text color="error">{under.said}</Text>}
       <Box key="lineButtons" flexDirection="row" gap={1}>
-        <Button key={COMMENT_KEY} onPress={() => openComment($)}>
-          Comment
-        </Button>
-        {look.isMobile ? null : (
-          <Button key={EDIT_KEY} onPress={() => openEdit($)}>
-            Edit
-          </Button>
-        )}
+        {offer.buttons.map((label) => {
+          const key = label === 'Edit' ? EDIT_KEY : COMMENT_KEY
+          return (
+            <Button key={key} onPress={takenByPressHook}>
+              {label}
+            </Button>
+          )
+        })}
       </Box>
     </Box>
   )
@@ -1405,7 +1419,7 @@ function actingBox(
       ))}
       {from > 1 ? countRow(els, 'earlier', `+${from - 1} earlier lines`) : null}
       {labels.slice(from - ideal.from, to - ideal.from + 1).flatMap((label, i) => [
-        <Button key={`line:${from + i}`} plain onPress={() => pickLine($, from + i)}>
+        <Button key={lineKey(from + i)} plain onPress={takenByPressHook}>
           {label}
         </Button>,
         picked === from + i ? lineActions($, els, look, form) : null,
@@ -1417,13 +1431,6 @@ function actingBox(
 
 /** The file the Changes section shows: its path, its view, and the whole-file text beside a diff. */
 type SectionFile = { path: string; view: FileView; whole: FileView | null }
-
-/** The box open under the selected line: a box belongs to its line alone, so one kept for another line reads as none. */
-async function boxOf($: EngineInterface, picked: number | null): Promise<'comment' | 'edit' | null> {
-  if (picked === null) return null
-  if ((await read($, commentLine)) === picked) return 'comment'
-  return editOf(await read($, editBox))?.line === picked ? 'edit' : null
-}
 
 /** The view area's box for a file, with what the acting form adds to the Changes section: whether it is on (null where the file has no text to act on) and the lines the `Line N` buttons name. */
 async function sectionParts(
@@ -1438,14 +1445,14 @@ async function sectionParts(
   const shownView = sectionView(file.view, file.whole, isWhole)
   const reading = viewBox(els, file.path, shownView, room)
   if (text === null) return { view: reading, acting: null, jumps: [] }
-  if ((await read($, isActing)) !== true) {
+  const acting = actingIn(await readFileView($))
+  if (acting === null) {
     const jumps = 'diff' in shownView ? jumpsOf(shownView.diff, linesOf(text).length) : []
     return { view: reading, acting: false, jumps }
   }
-  const picked = pickedLine(await read($, selectedLine))
-  const box = await boxOf($, picked)
-  const said = picked === null ? null : noticeOf(await read($, notice))
-  const original = editOf(await read($, editBox))?.original ?? ''
+  const { line: picked, box: open, notice: said } = acting
+  const box = open?.kind ?? null
+  const original = open?.kind === 'edit' ? open.original : ''
   const form = { leads: file.view.leads ?? [], lines: linesOf(text), picked, room, box, said, original }
   return { view: actingBox($, els, look, form), acting: true, jumps: [] }
 }
@@ -1463,7 +1470,8 @@ async function viewArea(
   const file = shown
   if (file?.view == null || file.path !== selectedPath) return null
   const description = await descriptionOf($, file.ask)
-  const isWhole = (await read($, isWholeFile)) === true
+  const view = await readFileView($)
+  const isWhole = view.kind === 'file' && view.whole
   const room = MAX_DRAWN - SLACK - reserved - (description?.length ?? 0)
   const parts = await sectionParts($, els, look, { path: file.path, view: file.view, whole: file.whole }, isWhole, room)
   return { description, changes: hunksOf(file.view), whole: file.whole === null ? null : isWhole, ...parts }
@@ -1492,32 +1500,41 @@ async function revealSelected($: EngineInterface) {
   if (saved === null) return
   const path = absoluteOf(await $.session.cwd(), saved)
   const system = await systemOfSession($)
-  const isFolder = isFolderPath(withDefaults(await savedRecords($)), path)
+  const isFolder = isFolderPath(await read($, records), path)
   const stillExists = await $.fs.exists(path)
   const nearest = stillExists ? path : await nearestFolder($, path)
   const { argv } = reveal({ system, path, isFolder, stillExists, nearestFolder: nearest })
   // A program that cannot start rejects, and so does one that outruns its time: both read as a failure.
-  const r = await $.process.run(argv, { timeoutMs: 5000 }).catch(() => null)
-  if (r?.exitCode !== 0) $.ui.toast(`Could not reveal ${path}`)
+  const failure = await $.process
+    .run(argv, { timeoutMs: 5000 })
+    .then((r) => (r.exitCode === 0 ? null : `the file manager exited with code ${r.exitCode}`), errorText)
+  if (failure !== null) $.ui.toast(`Could not reveal ${path} ${because(failure)}`)
 }
 
-/** The notice for an Open in Files the app could not do. */
-const OPEN_FILES_FAILED = 'Could not open this file in Files.'
+/** The notice for an Open in Files the app could not do, `failure` being why; none where it worked. */
+const openFilesNotice = (failure: string | null) =>
+  failure === null ? null : `Could not open this file in Files ${because(failure)}.`
+
+/** Asks the app to show a pane. Why it could not: the call was refused, or the app answered that it failed. Null where it worked. */
+async function showPane($: EngineInterface, args: Record<string, unknown>): Promise<string | null> {
+  const r = await attempt($.mcp.call('ccd_view', 'show_pane', args))
+  if (!r.ok) return r.reason
+  return r.value.isError ? mcpFailure(r.value) : null
+}
 
 /** Shows the selected file, at the selected line, in the desktop app's own Files pane. */
-async function openInFiles($: EngineInterface) {
+async function openInFiles($: EngineInterface, surface: RenderSurface) {
   const saved = await read($, selected)
   if (saved === null) return
   const path = absoluteOf(await $.session.cwd(), saved)
-  // The line belongs to the acting form: one picked there stays in saved state when the form goes off, and is not sent.
+  // The line belongs to the acting form, and goes with it when the form goes off.
   // The App form has no acting form, and one a terminal left behind sends no line from it.
-  const isFormOn = !(await isInApp($)) && (await read($, isActing)) === true
-  const line = isFormOn ? pickedLine(await read($, selectedLine)) : null
+  const line = (await isAppOn($, surface)) ? null : (actingIn(await readFileView($))?.line ?? null)
   // No selected line sends no line: the pane then opens where it opens, and a line of 1 would scroll it to the top.
   const args = line === null ? { pane: 'file', path } : { pane: 'file', path, line }
   // A server that is not connected rejects, and the app can answer that the call failed: both read as a failure.
-  const r = await $.mcp.call('ccd_view', 'show_pane', args).catch(() => null)
-  await update($, filesNotice, () => (r === null || r.isError ? OPEN_FILES_FAILED : null))
+  const failure = await showPane($, args)
+  await update($, filesNotice, () => openFilesNotice(failure))
 }
 
 /** The Open rule for a file in the App form: git's status for the file alone decides between the App diff and the App file pane; a file that is gone with no record opens nothing and says so. `path` is absolute. */
@@ -1530,14 +1547,41 @@ async function openRule($: EngineInterface, path: string) {
   const opening = openingOf(answer, exists)
   if (opening === 'gone') return update($, filesNotice, () => goneNotice(path))
   const args = opening === 'diff' ? { pane: 'diff', path, diff_scope: 'uncommitted' } : { pane: 'file', path }
-  const opened = await $.mcp.call('ccd_view', 'show_pane', args).catch(() => null)
-  await update($, filesNotice, () => (opened === null || opened.isError ? OPEN_FILES_FAILED : null))
+  const failure = await showPane($, args)
+  await update($, filesNotice, () => openFilesNotice(failure))
 }
 
-/** A press on a file row in the App form: the row is selected, its last notice goes, then the Open rule runs. `path` is absolute. */
-async function pressAppFile($: EngineInterface, path: string) {
+/**
+ * A press on a file, `path` absolute. The App form selects the row, drops its last notice, then runs the Open rule;
+ * the terminal opens the File view on the file. Which form it is follows `surface`, where the press came from, and
+ * whether the app draws the session, read here when pressed. `between` runs once the file is selected, before the
+ * Open rule. In the App form a `between` that throws still lets the Open rule run, then throws again so the caller
+ * can tell the user; the first failure is the one told, even when the Open rule fails too. The terminal has no Open rule, so its throw ends the press.
+ */
+async function pressFile(
+  $: EngineInterface,
+  path: string,
+  surface: RenderSurface,
+  between: () => Promise<unknown> = () => Promise.resolve(),
+) {
+  if (!(await isAppOn($, surface))) {
+    await clickFile($, path)
+    return between()
+  }
   await Promise.all([selectFile($, path), update($, filesNotice, () => null)])
-  await openRule($, path)
+  let failure: { err: unknown } | null = null
+  try {
+    await between()
+  } catch (err) {
+    failure = { err }
+  }
+  try {
+    await openRule($, path)
+  } catch (err) {
+    // Dropped on purpose when the Files pane open already failed: the first failure is the one told.
+    if (failure === null) throw err
+  }
+  if (failure !== null) throw failure.err
 }
 
 /** The Reveal button for the selected file or folder, named for the system's file manager. */
@@ -1551,11 +1595,11 @@ async function revealRow($: EngineInterface, els: ElementTable, look: Look, sele
   return (
     <Box key="revealRow" flexDirection="column">
       <Box key="revealButtons" flexDirection="row" gap={1}>
-        <Button key={REVEAL_KEY} {...hotkeyOf(look, 'reveal')} onPress={() => revealSelected($)}>
+        <Button key={REVEAL_KEY} {...hotkeyOf(look, 'reveal')} onPress={takenByPressHook}>
           {label}
         </Button>
         {canOpenFiles ? (
-          <Button key={OPEN_FILES_KEY} onPress={() => openInFiles($)}>
+          <Button key={OPEN_FILES_KEY} onPress={takenByPressHook}>
             Open in Files
           </Button>
         ) : null}
@@ -1581,7 +1625,7 @@ type OpenFile = {
 /** The Type icon, then the name in bold, the Tag and the line counts. */
 function fileTitle(els: ElementTable, look: Look, f: OpenFile) {
   const { Box, Text } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   const name = f.path.slice(f.path.lastIndexOf('/') + 1)
   const icon = typeIconOf(name)
   const counts = countsOf(f.path, f.entry)
@@ -1706,12 +1750,12 @@ function changesSection(
       <Text bold>Changes</Text>
       <Text color={GREY}>{String(area.changes)}</Text>
       {area.whole === null ? null : (
-        <Button key={WHOLE_KEY} {...hotkeyOf(look, 'whole')} onPress={() => toggleWholeFile($)}>
+        <Button key={WHOLE_KEY} {...hotkeyOf(look, 'whole')} onPress={takenByPressHook}>
           {area.whole ? 'Show changes' : 'Show whole file'}
         </Button>
       )}
       {area.acting === null ? null : (
-        <Button key={ACTING_KEY} {...hotkeyOf(look, 'acting')} onPress={() => toggleActing($)}>
+        <Button key={ACTING_KEY} {...hotkeyOf(look, 'acting')} onPress={takenByPressHook}>
           {area.acting ? 'Read only' : 'Comment or edit'}
         </Button>
       )}
@@ -1720,7 +1764,7 @@ function changesSection(
       <Box key="jumps" flexDirection="row" gap={1}>
         <Text color={GREY}>Jump to</Text>
         {area.jumps.map((n) => (
-          <Button key={`jump:${n}`} onPress={() => jumpToLine($, n)}>
+          <Button key={jumpKey(n)} onPress={takenByPressHook}>
             {`Line ${n}`}
           </Button>
         ))}
@@ -1744,11 +1788,11 @@ function barBox(
       {summaryText(els, summaryOf(touched))}
       <Box key="actions" gap={1} flexWrap="wrap">
         {Object.keys(touched).length === 0 ? null : (
-          <Button key={CHANGED_ONLY_KEY} {...hotkeyOf(look, 'changedOnly')} onPress={() => toggleChangedOnly($)}>
+          <Button key={CHANGED_ONLY_KEY} {...hotkeyOf(look, 'changedOnly')} onPress={takenByPressHook}>
             {isOnlyChanged ? 'All touched' : 'Changed only'}
           </Button>
         )}
-        <Button key={TRAIL_KEY} {...hotkeyOf(look, 'trail')} onPress={() => openTrail($)}>
+        <Button key={TRAIL_KEY} {...hotkeyOf(look, 'trail')} onPress={takenByPressHook}>
           Trail
         </Button>
       </Box>
@@ -1759,7 +1803,7 @@ function barBox(
 /** The line that ends the Group headed by `heading`: a picture one pixel tall on the desktop, a row of `─` in the terminal. */
 function divider(els: ElementTable, look: Look, name: string) {
   const { Box, Text } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   if (Svg === null)
     return (
       <Box key={`divider:${name}`}>
@@ -1874,7 +1918,7 @@ async function fileBody(
   return [
     isSplit ? null : (
       <Box key="backRow">
-        <Button key={BACK_KEY} {...hotkeyOf(look, 'back')} onPress={() => closeFile($)}>
+        <Button key={BACK_KEY} {...hotkeyOf(look, 'back')} onPress={takenByPressHook}>
           ‹ All files
         </Button>
       </Box>
@@ -1986,6 +2030,17 @@ async function paneBody($: EngineInterface, body: Body, isOpened: boolean, isOnl
   return opened ?? (await treeBody($, body, isOnlyChanged))
 }
 
+function pressHooks(on: On) {
+  // Every Files pane and Trail button press comes here; a key that is none of the tracer's goes on beneath.
+  on('ui.press', {}, async ($, e, next) => {
+    if (!isOwnPress(e)) return next(e)
+    if (filesPressOf(e.element) !== null) await press($, e.element, e.surface)
+    else if (trailPressOf(e.element) !== null) await pressTrail($, e.element, e.surface)
+    else return next(e)
+    return { element: e.element }
+  }).catch(($, e, next) => next(e))
+}
+
 function paneHooks(on: On) {
   // A click while the pane had the keyboard sends its own press; Tab and the arrows move the ring only
   // inside a focused pane. So focus from the person onto a button of an unfocused pane is a click.
@@ -1993,8 +2048,8 @@ function paneHooks(on: On) {
     const isClick = !isPaneFocused && e.origin.kind === 'person'
     const out = await next(e)
     // The ring moving off every element of the pane (Esc, or a click outside) closes the Comment box, which cannot keep the keys.
-    if (e.element === undefined) await closeBox($)
-    if (isClick) await pressByKey($, e.element)
+    if (e.element === undefined) await reported($, 'close the box', () => closeBox($))
+    if (isClick) await press($, e.element, REPLAY_SURFACE)
     return out
   }).catch(($, e, next) => next(e))
 
@@ -2006,14 +2061,14 @@ function paneHooks(on: On) {
     const saved = await read($, selected)
     // A selection saved before groups existed is relative to the session's directory.
     const selectedPath = saved === null ? null : absoluteOf(cwd, saved)
-    const touched = withDefaults(await savedRecords($))
+    const touched = await read($, records)
     const home = (await $.env.get('HOME')) ?? null
     const look = await lookOf($, e.surface, e.props.bodyColumns)
     const { isApp } = look
     const isOnlyChanged = (await read($, isChangedOnly)) === true
     const canReveal = e.surface !== 'mobile'
     const isOpened =
-      !isApp && selectedPath !== null && touched[selectedPath] !== undefined && (await read($, isFileOpen)) === true
+      !isApp && selectedPath !== null && touched[selectedPath] !== undefined && (await readFileView($)).kind === 'file'
     const isSplit = isOpened && look.columns >= WIDE_COLUMNS
     const body = { els, look, touched, selectedPath, cwd, home, canReveal, isSplit }
     const waiting = attachedOf(await read($, attached)).length
@@ -2034,7 +2089,7 @@ function paneHooks(on: On) {
 /** The header bar of a Turn: the chevron, the prompt's first line and the Touch count, on the raised fill on the desktop; in the terminal a row of characters. */
 function turnHeader($: EngineInterface, els: ElementTable, look: Look, t: TrailTurn) {
   const { Box, Text, Button } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   const fill = look.isDesktop ? { backgroundColor: RAISED_FILL, paddingX: 1 } : {}
   return (
     <Box key={`turnHeader:${t.n}`} flexDirection="row" gap={1} {...fill}>
@@ -2046,7 +2101,7 @@ function turnHeader($: EngineInterface, els: ElementTable, look: Look, t: TrailT
         )}
       </Box>
       <Box key={`prompt:${t.n}`} flexGrow={1} flexShrink={1}>
-        <Button key={turnKey(t.n)} plain onPress={() => toggleTurn($, t.n)}>
+        <Button key={turnKey(t.n)} plain onPress={takenByPressHook}>
           <Text bold wrap="truncate-end">
             {t.text}
           </Text>
@@ -2060,7 +2115,7 @@ function turnHeader($: EngineInterface, els: ElementTable, look: Look, t: TrailT
 /** The timeline's cell in a row: a small picture on the desktop, `├─` or `└─` in the terminal. The last row of a Turn ends the line. */
 function timelineCell(els: ElementTable, look: Look, isLast: boolean) {
   const { Box, Text } = els
-  const Svg = svgOf(els, look)
+  const Svg = svgOf(look.surface, els)
   const cell = isLast ? 'elbow' : 'tee'
   return (
     <Box width={2} flexShrink={0}>
@@ -2094,7 +2149,7 @@ function trailTouchRow(
       )}
       <Text color={GREY}>{String(t.n)}</Text>
       <Text color={COLOR[t.kind] ?? GREY}>{t.kind}</Text>
-      <Button key={`trailFile:${t.n}`} plain onPress={() => pressTouch($, t, look.isApp)}>
+      <Button key={touchKey(t.n)} plain onPress={takenByPressHook}>
         <Text wrap="truncate-middle" {...(isPicked && !look.isDesktop ? { bold: true } : {})}>
           {t.path.slice(t.path.lastIndexOf('/') + 1)}
         </Text>
@@ -2192,28 +2247,36 @@ function turnRows($: EngineInterface, els: ElementTable, look: Look, t: TrailTur
 /** Whether the Trail had the keyboard at its last drawing; like the Files pane, it takes a first click on focusing it. */
 let isTrailFocused = false
 
-/** The address of a Turn's header button: `turn:` and the Turn's number. */
-const turnKey = (n: number) => `turn:${n}`
+/** The address of a Turn's header button. */
+const turnKey = (n: number) => trailKey({ kind: 'turn', n })
 
-/** Runs the action of the Trail button a first click on the unfocused Trail landed on, as its onPress would. */
-async function pressTrailKey($: EngineInterface, key: string | undefined) {
-  if (key === CLAUDE_ONLY_KEY) return toggleClaudeOnly($)
-  const turn = /^turn:(\d+)$/.exec(key ?? '')
-  if (turn?.[1] !== undefined) return toggleTurn($, Number(turn[1]))
-  const file = /^trailFile:(\d+)$/.exec(key ?? '')
-  const touch = (await readLog($)).find((x) => x.type === 'touch' && x.n === Number(file?.[1]))
-  if (touch?.type === 'touch') return pressTouch($, touch, await isInApp($))
+/** The address of a Touch's button in the Trail. */
+const touchKey = (n: number) => trailKey({ kind: 'trailFile', n })
+
+/** Runs the press a Trail key names, `surface` being where it came from. The tracer's `ui.press` hook and a first click on the unfocused Trail both call it, so each action is written once. */
+const pressTrail = ($: EngineInterface, key: string | undefined, surface: RenderSurface) =>
+  reported($, pressAction(key), () => trailAction($, key, surface))
+
+/** The action a Trail key names. */
+async function trailAction($: EngineInterface, key: string | undefined, surface: RenderSurface) {
+  const p = trailPressOf(key)
+  if (p === null) return
+  if (p.kind === 'claudeOnly') return toggleClaudeOnly($)
+  return p.kind === 'turn' ? toggleTurn($, p.n) : pressTouch($, p.n, surface)
 }
 
-function trailHooks(on: On) {
+function trailFocusHook(on: On) {
   // A first click on an unfocused Trail sends no press; the focus lands on the button, which runs its action.
   on('ui.focus', { requestId: TRAIL_PANE }, async ($, e, next) => {
     const isClick = !isTrailFocused && e.origin.kind === 'person'
     const out = await next(e)
-    if (isClick) await pressTrailKey($, e.element)
+    if (isClick) await pressTrail($, e.element, REPLAY_SURFACE)
     return out
   }).catch(($, e, next) => next(e))
+}
 
+function trailHooks(on: On) {
+  trailFocusHook(on)
   on('ui.render', { component: 'Pane', requestId: TRAIL_PANE }, async ($, e) => {
     isTrailFocused = e.props.isFocused
     const els = $.ui.resolve(e)
@@ -2230,7 +2293,7 @@ function trailHooks(on: On) {
       <Box key="trail" flexDirection="column">
         {trail.turns.length === 0 ? null : (
           <Box key="trailBar" justifyContent="flex-end">
-            <Button key={CLAUDE_ONLY_KEY} {...hotkeyOf(look, 'claudeOnly')} onPress={() => toggleClaudeOnly($)}>
+            <Button key={CLAUDE_ONLY_KEY} {...hotkeyOf(look, 'claudeOnly')} onPress={takenByPressHook}>
               {isOnlyClaude ? 'Show all' : 'Show Claude only'}
             </Button>
           </Box>
@@ -2272,6 +2335,7 @@ export const register = (on: On): void => {
   toolHooks(on)
   commandHooks(on)
   closeHooks(on)
+  pressHooks(on)
   paneHooks(on)
   trailHooks(on)
 }

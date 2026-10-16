@@ -1,4 +1,4 @@
-import type { SavedEntry, Tag, RecordEntry } from '../../types'
+import type { Tag, RecordEntry } from '../../types'
 
 /** The longest baseline kept: the engine's code view draws no more characters than this. */
 const MAX_BASELINE = 100_000
@@ -20,26 +20,6 @@ export type Touch = {
 
 /** Tags from smallest to biggest. */
 const RANK: readonly Tag[] = ['Read', 'Edited', 'Moved', 'Created', 'Deleted']
-
-/** The saved records with a default in every field an older version did not save. */
-export const withDefaults = (saved: Record<string, SavedEntry>): Record<string, RecordEntry> =>
-  Object.fromEntries(
-    Object.entries(saved).map(([path, e]) => [
-      path,
-      typeof e === 'string'
-        ? { tag: e, isRecent: false, order: 0, baseline: null, isBaselineTooBig: false }
-        : {
-            tag: e.tag,
-            isRecent: e.isRecent ?? false,
-            order: e.order ?? 0,
-            baseline: e.baseline ?? null,
-            isBaselineTooBig: e.isBaselineTooBig ?? false,
-            ...(e.isByUser === true ? { isByUser: true } : {}),
-            ...(e.oldPath === undefined ? {} : { oldPath: e.oldPath }),
-            ...(e.lastSeen === undefined ? {} : { lastSeen: e.lastSeen }),
-          },
-    ]),
-  )
 
 /** The baseline a record keeps for a text: the text, or none and a note when it runs over the most kept. */
 function baselineOf(text: string | null): Pick<RecordEntry, 'baseline' | 'isBaselineTooBig'> {

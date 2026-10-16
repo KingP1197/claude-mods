@@ -2,55 +2,19 @@
 // validator follows `$` only within one file, so the hooks live in register.tsx.
 // A card appears when an agent spawns. Finished cards stay until the next batch
 // starts, that is, until an agent spawns while none is running.
-import type { AgentInfo, AgentStatus, ModelUsage, ToolSpec } from 'claude-code'
+import type { ToolSpec } from 'claude-code'
 
-import type { AgentRow, AgentState, AgentTokens, Step, StepStatus } from '../../types'
+import type { AgentRow, AgentState, Step, StepStatus } from '../../types'
+import { reasonText } from '../failures'
+import { isLive, isLiveState } from '../live'
 import type { BarKind, Hat } from './critter'
 
 export const PANE = 'agent-board'
 export const TITLE = 'Agents'
 export const COMMAND = 'agent-board'
 
-// The board's button keys. A first click on an unfocused board arrives only as focus landing
-// on one of these, so the focus hook reads the button back from its key.
-export const nameKey = (id: string) => `name:${id}`
-export const stopKey = (id: string) => `stop:${id}`
-export const FINISHED_KEY = 'toggle-finished'
-export const moreKey = (id: string) => `more:${id}`
-export const earlierKey = (id: string) => `earlier:${id}`
-/** An Agent call's target: it opens the Card of the row `id`, the agent the call started. */
-export const childKey = (id: string) => `child:${id}`
-export const sectionKey = (id: string, which: SectionName) => `section:${id}:${which}`
-
 /** The two sections of an open card that close; its footer does not. */
 export type SectionName = 'brief' | 'transcript'
-
-type Pressed =
-  | { kind: 'name'; id: string }
-  | { kind: 'stop'; id: string }
-  | { kind: 'more'; id: string }
-  | { kind: 'earlier'; id: string }
-  | { kind: 'child'; id: string }
-  | { kind: 'section'; id: string; which: SectionName }
-  | { kind: 'finished' }
-
-const PLAIN_KINDS = ['name', 'stop', 'more', 'earlier', 'child'] as const
-const SECTION_NAMES: readonly SectionName[] = ['brief', 'transcript']
-
-/** The section button a key names: its card and which section it closes. */
-function sectionPress(key: string | undefined): Pressed | null {
-  const m = /^section:(.+):([a-z]+)$/.exec(key ?? '')
-  const which = SECTION_NAMES.find((n) => n === m?.[2])
-  return m === null || which === undefined ? null : { kind: 'section', id: m[1] ?? '', which }
-}
-
-/** The button a key names, or null for an element that is no button, such as the message box. */
-export function buttonOf(key: string | undefined): Pressed | null {
-  if (key === FINISHED_KEY) return { kind: 'finished' }
-  const m = /^([a-z]+):(.+)$/.exec(key ?? '')
-  const kind = PLAIN_KINDS.find((k) => k === m?.[1])
-  return kind === undefined ? sectionPress(key) : { kind, id: m?.[2] ?? '' }
-}
 
 // Subagents get no to-do tools, so the board gives them its own: a whole list of steps per call.
 const TOOL_NAME = 'report_progress'
@@ -109,25 +73,6 @@ export function stepsFromReport(steps: unknown): Step[] | null {
   return out
 }
 
-export const isLive = (r: AgentRow) => r.state === 'running' || r.state === 'idle'
-
-function stateOf(s: AgentStatus, isTeammate: boolean): AgentState {
-  switch (s) {
-    case 'pending':
-    case 'running':
-      return 'running'
-    case 'waiting':
-    case 'idle':
-      return isTeammate ? 'idle' : 'running'
-    case 'completed':
-      return 'done'
-    case 'failed':
-      return 'failed'
-    case 'killed':
-      return 'stopped'
-  }
-}
-
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
 /** `claude-opus-5-5` reads `Opus 5.5`; a date suffix is dropped; an alias is capitalised. */
@@ -151,32 +96,25 @@ export function clockText(ms: number): string {
 export const short = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
 
-/** One request's whole input plus its output. */
-const allOf = (u: ModelUsage) =>
-  u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
+/** What sets a line's parts apart where they share a row: the token line's, and the rows `partRows` packs. */
+export const PART_SEP = ' | '
 
-/** Adds one request's counts; a request already counted (same key) changes nothing. */
-export function addTokens(t: AgentTokens | undefined, u: ModelUsage, key: string): AgentTokens {
-  if (t?.lastRequest === key) return t
-  const all = allOf(u)
-  return {
-    context: all,
-    total: (t?.total ?? 0) + all,
-    output: (t?.output ?? 0) + u.output_tokens,
-    requests: (t?.requests ?? 0) + 1,
-    lastRequest: key,
-  }
+/** The opened card's token line in its parts, which the line joins with PART_SEP; a row breaks only between them. */
+export function tokenParts(r: AgentRow): string[] {
+  const t = r.tokens
+  if (t === undefined)
+    return [isLive(r) ? 'Tokens: none yet. The count starts when its first request answers.' : 'Tokens: none reported.']
+  const when = isLive(r) ? 'now' : 'at the end'
+  const reqs = `${t.requests} request${t.requests === 1 ? '' : 's'}`
+  return [
+    `Tokens: ${short(t.context)} in its context ${when}`,
+    `${short(t.total)} used in all, over ${reqs}`,
+    `${short(t.output)} written by it`,
+  ]
 }
 
 /** The opened card's token line, under its brief. */
-export function tokensLine(r: AgentRow): string {
-  const t = r.tokens
-  if (t === undefined)
-    return isLive(r) ? 'Tokens: none yet. The count starts when its first request answers.' : 'Tokens: none reported.'
-  const when = isLive(r) ? 'now' : 'at the end'
-  const reqs = `${t.requests} request${t.requests === 1 ? '' : 's'}`
-  return `Tokens: ${short(t.context)} in its context ${when} | ${short(t.total)} used in all, over ${reqs} | ${short(t.output)} written by it`
-}
+export const tokensLine = (r: AgentRow): string => tokenParts(r).join(PART_SEP)
 
 /** The mark at a card's right edge, with the word that names the state, both in the state's colour.
  *  Only the running word is bold: Claude's colour on text is bold throughout the design system.
@@ -196,7 +134,7 @@ export const MARK: Record<
 
 /** Which fill a card's bar wears: orange while it runs, red when it failed, grey once it ended otherwise. */
 export const barKindOf = (state: AgentState): BarKind =>
-  state === 'running' || state === 'idle' ? 'live' : state === 'failed' ? 'failed' : 'done'
+  isLiveState(state) ? 'live' : state === 'failed' ? 'failed' : 'done'
 
 /** The terminal's bar cannot draw the Svg's hex, so each kind takes a theme key. */
 export const BAR_KEY: Record<BarKind, string> = { live: 'claude', done: 'inactive', failed: 'error' }
@@ -215,24 +153,6 @@ export const tierOf = (effort: string | null): Tier => ({
 /** A TodoWrite call's list, which replaces the whole list. */
 export const stepsFromTodos = (todos: readonly { content: string; status: StepStatus }[]): Step[] =>
   todos.map((t, i) => ({ id: `todo${i}`, title: t.content, status: t.status }))
-
-/** A TaskCreate call's new task, last in the list. */
-export const addStep = (steps: readonly Step[] | undefined, id: string, title: string): Step[] => [
-  ...(steps ?? []).filter((s) => s.id !== id),
-  { id, title, status: 'pending' },
-]
-
-/** A TaskUpdate call's change to one task; `deleted` drops it. A task this board never saw changes nothing. */
-export function changeStep(
-  steps: readonly Step[] | undefined,
-  id: string,
-  change: { status?: StepStatus | 'deleted'; title?: string },
-): Step[] | undefined {
-  if (steps === undefined) return undefined
-  if (change.status === 'deleted') return steps.filter((s) => s.id !== id)
-  const status = change.status
-  return steps.map((s) => (s.id !== id ? s : { ...s, status: status ?? s.status, title: change.title ?? s.title }))
-}
 
 /** `3/5 | Hero copy`: items done of all, then the one in progress. Null without a list. */
 function stepLine(steps: readonly Step[] | undefined): string | null {
@@ -279,56 +199,6 @@ export function totals(rows: readonly AgentRow[], t: number) {
   return { count: rows.length, tokens, spanMs: end - start }
 }
 
-/** An agent spawned while none runs starts a new batch, which clears the last one's cards. */
-export const startBatch = (rows: readonly AgentRow[]): AgentRow[] => (rows.some(isLive) ? [...rows] : [])
-
-/** Moves a live row to a new state; an ended row keeps its final state and time. */
-export const moveTo = (r: AgentRow, state: AgentState, t: number): AgentRow =>
-  isLive(r) ? { ...r, state, endedAt: state === 'running' || state === 'idle' ? null : t } : r
-
-/** The row as its agent's own request reports it: exact model and effort. */
-export function observed(r: AgentRow, model: string, level: string | null): AgentRow {
-  return level === null ? { ...r, model } : { ...r, model, effort: level, isEffortInherited: false }
-}
-
-/** How a subagent's finished turn ends its row; a teammate's turn only idles it. */
-export const endingOf = (reason: string, isTeammate: boolean): AgentState =>
-  isTeammate ? 'idle' : reason === 'aborted' ? 'stopped' : reason === 'answer' ? 'done' : 'failed'
-
-/** What an agent reported before its spawn's answer linked it to a row. */
-export type Early = {
-  step?: { model: string; effort: string | null }
-  reason?: string
-  tokens?: AgentTokens
-  steps?: Step[]
-}
-
-/** A row once its spawn answers, with whatever its agent reported before that. */
-export function settle(r: AgentRow, early: Early | undefined, t: number): AgentRow {
-  const seen = early?.step === undefined ? r : observed(r, early.step.model, early.step.effort)
-  const known = early?.tokens === undefined ? seen : { ...seen, tokens: early.tokens }
-  const listed = early?.steps === undefined ? known : { ...known, steps: early.steps }
-  return early?.reason === undefined ? listed : moveTo(listed, endingOf(early.reason, listed.isTeammate), t)
-}
-
-/** Folds the engine's agent list into the rows' states. */
-export function reconcile(rows: readonly AgentRow[], infos: readonly AgentInfo[], t: number): AgentRow[] {
-  const byId = new Map(infos.map((i) => [i.id, i]))
-  return rows.map((r) => {
-    if (r.agentId === null || !isLive(r)) return r
-    const info = byId.get(r.agentId)
-    // Listed agents stay listed until well after they end, so a missing one has ended without
-    // a report this plugin saw; how it ended is unknown, so it reads lost rather than done.
-    // A workflow's agents are never listed; their turn.complete ends them instead.
-    if (info === undefined) return r.isWorkflow ? r : moveTo(r, 'lost', t)
-    const state = stateOf(info.status, r.isTeammate)
-    return state === r.state ? r : moveTo(r, state, t)
-  })
-}
-
-/** A finished agent woken by a message runs again; a live one is unchanged. */
-export const resumed = (r: AgentRow): AgentRow => (isLive(r) ? r : { ...r, state: 'running', endedAt: null })
-
 /** What the user can do after a permission check, such as auto mode's, refused the board's call to a tool. */
 export const permissionHint = (tool: CardTool) => `Switch modes, or add ${tool} to your allow list.`
 
@@ -343,5 +213,6 @@ type CardTool = keyof typeof REFUSED
 /** The note under the box after a card's send or stop was refused: only what to do when a permission check
  *  refused it (its own reason is written for Claude, not the user), else the reason. */
 export function refusalNote(tool: CardTool, reason: string): string {
-  return isPermissionRefusal(reason) ? permissionHint(tool) : `${REFUSED[tool]}: ${reason.trim().replace(/\.+$/, '')}.`
+  if (isPermissionRefusal(reason)) return permissionHint(tool)
+  return `${REFUSED[tool]}: ${reasonText(reason)}.`
 }

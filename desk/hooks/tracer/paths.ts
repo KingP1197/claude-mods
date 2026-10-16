@@ -1,3 +1,5 @@
+import { BUTTON_PAD } from '../surface'
+
 /** A path as the pane shows it outside the project: from `~/` where it sits under the home folder, whole otherwise. */
 export function shortPath(path: string, home: string | null): string {
   const base = home?.replace(/\/$/, '') ?? null
@@ -79,9 +81,6 @@ export function middleCut(text: string, room: number): string {
   return `${text.slice(0, keep - end)}…${text.slice(text.length - end)}`
 }
 
-/** The cells the desktop app draws around a Button's label beyond the label itself. */
-const BUTTON_CHROME = 2
-
 /** The fewest characters a cut name gets, however narrow the pane. A name given more than the row has left spills out of its column, so this is small. */
 const LEAST_ROOM = 4
 
@@ -97,7 +96,7 @@ const COUNTS_GAPS = 1 + 1 + 1
 /**
  * How many characters a file row's name button may hold in a pane `columns` cells wide. A row draws, one cell apart:
  * the indent (2 per level), the marker, the chevron cell, the icon cell, the button, the Tag, the dot and the counts (`countCells`, the width of each of the two columns as the row draws them).
- * The desktop app draws the button wider than its label (BUTTON_CHROME) and cuts a label that does not fit at its end,
+ * The desktop app draws the button wider than its label (BUTTON_PAD) and cuts a label that does not fit at its end,
  * so the mod cuts it first.
  */
 export function nameRoom(columns: number, row: RowShape): number {
@@ -105,11 +104,11 @@ export function nameRoom(columns: number, row: RowShape): number {
   const tag = row.tag === null ? 0 : 1 + row.tag.length
   const dot = row.isRecent ? 2 : 0
   const counts = COUNTS_GAPS + row.countCells[0] + row.countCells[1]
-  return Math.max(columns - row.depth * 2 - BEFORE_NAME - tag - dot - counts - BUTTON_CHROME, LEAST_ROOM)
+  return Math.max(columns - row.depth * 2 - BEFORE_NAME - tag - dot - counts - BUTTON_PAD, LEAST_ROOM)
 }
 
 /** The cells a Group heading draws beside its place: the marker, the chevron cell, the name, the count and the five gaps between its six parts. The name is a Button on the desktop, which draws it wider than its label. */
-const GROUP_CELLS = 1 + 2 + BUTTON_CHROME + 5
+const GROUP_CELLS = 1 + 2 + BUTTON_PAD + 5
 
 /** How many characters a Group heading's place may hold in a pane `columns` cells wide, after its name and its count; unlimited where the pane reports no width. */
 export function placeRoom(columns: number, name: string, count: number): number {
@@ -119,20 +118,20 @@ export function placeRoom(columns: number, name: string, count: number): number 
 /**
  * How many characters a folder row's label may hold in a pane `columns` cells wide, `levels` tree levels down. The
  * desktop row draws, one cell apart: the marker, the chevron cell, the folder icon and the name button, which the app
- * draws wider than its label (BUTTON_CHROME). The terminal's has no icon and a one-cell chevron, and its label ends in a slash.
+ * draws wider than its label (BUTTON_PAD). The terminal's has no icon and a one-cell chevron, and its label ends in a slash.
  */
 export function folderRoom(columns: number, levels: number, isDesktop: boolean): number {
   if (columns <= 0) return Infinity
-  const before = isDesktop ? 1 + 1 + 2 + 1 + 2 + 1 + BUTTON_CHROME : 1 + 1 + 1 + 1
+  const before = isDesktop ? 1 + 1 + 2 + 1 + 2 + 1 + BUTTON_PAD : 1 + 1 + 1 + 1
   return Math.max(columns - levels * 2 - before, LEAST_ROOM)
 }
 
 /**
  * How many characters of a line the acting form's row may hold in a pane `columns` cells wide, after its number (`numberWidth`
- * digits) and the two spaces behind it. The desktop app draws a Button wider than its label (BUTTON_CHROME) and cuts
+ * digits) and the two spaces behind it. The desktop app draws a Button wider than its label (BUTTON_PAD) and cuts
  * a label that does not fit at its end, so the mod cuts it first.
  */
 export function lineRoom(columns: number, numberWidth: number, isDesktop: boolean): number {
   if (columns <= 0) return Infinity
-  return Math.max(columns - numberWidth - 2 - (isDesktop ? BUTTON_CHROME : 0), LEAST_ROOM)
+  return Math.max(columns - numberWidth - 2 - (isDesktop ? BUTTON_PAD : 0), LEAST_ROOM)
 }

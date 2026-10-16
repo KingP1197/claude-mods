@@ -86,16 +86,17 @@ export function fitWindow(
 export const pickedLine = (value: unknown): number | null =>
   typeof value === 'number' && Number.isInteger(value) && value >= 1 ? value : null
 
-/** What a line button's address names: a line row (`line:7`) or a `Line N` button under Changes (`jump:7`); null for any other address. */
-export function lineKeyOf(key: string | undefined): { kind: 'line' | 'jump'; n: number } | null {
-  const found = /^(line|jump):(\d+)$/.exec(key ?? '')
-  return found === null ? null : { kind: found[1] === 'jump' ? 'jump' : 'line', n: Number(found[2]) }
-}
+/** What draws under the selected line: the Comment box, the Edit box, or the line's own buttons, named by their labels. */
+export type LineOffer =
+  { kind: 'commentBox' } | { kind: 'editBox' } | { kind: 'buttons'; buttons: readonly ('Comment' | 'Edit')[] }
 
-/** The open Edit box as saved state holds it: the line it belongs to and the text it was opened with; null for any other value. Saved state can hold anything, and a bad value means no box. */
-export function editOf(value: unknown): { line: number; original: string } | null {
-  if (typeof value !== 'object' || value === null) return null
-  const { line, original } = value as Record<string, unknown>
-  const n = pickedLine(line)
-  return n === null || typeof original !== 'string' ? null : { line: n, original }
+/**
+ * What the acting form offers under the selected line, given the box saved there and whether the surface draws a typing
+ * field (inputOf, which already says the phone draws none). Edit needs a typing field: an Edit box left in saved state
+ * where nothing can type draws as the line's own buttons.
+ */
+export function lineOfferOf(under: { box: 'comment' | 'edit' | null; hasField: boolean }): LineOffer {
+  if (under.box === 'comment') return { kind: 'commentBox' }
+  if (under.box === 'edit' && under.hasField) return { kind: 'editBox' }
+  return { kind: 'buttons', buttons: under.hasField ? ['Comment', 'Edit'] : ['Comment'] }
 }

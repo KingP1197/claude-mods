@@ -5,27 +5,12 @@
 import type { ModelForkResult } from 'claude-code'
 
 import type { Side, SideTurn } from '../../types'
+import { because, errorText } from '../failures'
 
 export const SIDE_PANE = 'side-questions'
 export const NO_SIDE: Side = { turns: [], draft: '', draftSeq: 0, isAsking: false }
 /** The typing box's key in the panel. */
 export const ASK_BOX = 'askbox'
-
-/** A turn as versions before the tagged turn saved it: two nullable fields. */
-type OldTurn = { question: string; answer: string | null; failure: string | null }
-
-const turnOf = (t: SideTurn | OldTurn): SideTurn => {
-  if ('state' in t) return t
-  if (t.answer !== null) return { question: t.question, state: 'answered', answer: t.answer }
-  if (t.failure !== null) return { question: t.question, state: 'failed', failure: t.failure }
-  return { question: t.question, state: 'pending' }
-}
-
-/** Saved state outlives a reload: fills in fields an older version left out, and moves old turns to the tagged shape. */
-export function sideOf(saved: Side): Side {
-  const s = { ...NO_SIDE, ...saved }
-  return { ...s, turns: (s.turns as readonly (SideTurn | OldTurn)[]).map(turnOf) }
-}
 
 const answered = (turns: readonly SideTurn[]) =>
   turns.filter((t): t is Extract<SideTurn, { state: 'answered' }> => t.state === 'answered')
@@ -61,3 +46,6 @@ export function forkFailure(r: ModelForkResult): string {
       return 'No answer: the question was cut off.'
   }
 }
+
+/** Why a side question got no answer when the engine failed the request outright. */
+export const forkThrew = (err: unknown): string => `No answer ${because(errorText(err))}.`

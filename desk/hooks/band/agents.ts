@@ -1,9 +1,10 @@
 // The Agent counter's figures, from the board's Batch. Nothing here calls the engine.
 import type { AgentRow } from '../../types'
+import { isLive } from '../live'
 
 /** How many agents of the Batch are Live (running or idle) and how many have finished (every other state). */
 export function countAgents(batch: readonly AgentRow[]): { live: number; finished: number } {
-  const live = batch.filter((r) => r.state === 'running' || r.state === 'idle').length
+  const live = batch.filter(isLive).length
   return { live, finished: batch.length - live }
 }
 
