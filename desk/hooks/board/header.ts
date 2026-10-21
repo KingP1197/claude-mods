@@ -37,8 +37,8 @@ const nameCells = (description: string): number => description.length + NAME_EXT
 
 /**
  * The word beside the state's dot. The full word where the row fits the name, one cell of air and the whole mark
- * (the dot, its gap and the word); where it does not, the word's short form: Running reads `live`, Waiting `idle`,
- * Failed `fail`, Stopped `stop`. Done and Lost are short already.
+ * (the dot, its gap and the word); where it does not, the word's short form: Waiting reads `idle`, Failed `fail`,
+ * Stopped `stop`. Running is `Live` at every width; Done and Lost are short already.
  */
 const stateWord = (state: keyof typeof MARK, name: number, cells: number): string => {
   const mark = MARK[state]

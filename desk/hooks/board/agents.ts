@@ -119,12 +119,12 @@ export const tokensLine = (r: AgentRow): string => tokenParts(r).join(PART_SEP)
 /** The mark at a card's right edge, with the word that names the state, both in the state's colour.
  *  Only the running word is bold: Claude's colour on text is bold throughout the design system.
  *  `short` is the word where the full one does not fit beside the name (see `stateWord` in header.ts):
- *  Running reads `live`, Waiting `idle`, Failed `fail`, Stopped `stop`; Done and Lost are short already. */
+ *  Waiting reads `idle`, Failed `fail`, Stopped `stop`; Running is `Live` at every width; Done and Lost are short already. */
 export const MARK: Record<
   AgentState,
   { glyph: string; word: string; short: string; color: string; isWordBold: boolean }
 > = {
-  running: { glyph: '●', word: 'Running', short: 'live', color: 'claude', isWordBold: true },
+  running: { glyph: '●', word: 'Live', short: 'Live', color: 'claude', isWordBold: true },
   idle: { glyph: '◌', word: 'Waiting', short: 'idle', color: 'inactive', isWordBold: false },
   done: { glyph: '✓', word: 'Done', short: 'Done', color: 'success', isWordBold: false },
   failed: { glyph: '✗', word: 'Failed', short: 'fail', color: 'error', isWordBold: false },

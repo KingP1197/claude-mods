@@ -1,7 +1,7 @@
 // The agent board: a side panel with one card per subagent of the current batch.
 // It opens by itself when a batch starts (an agent spawns while none runs); /agent-board reopens it.
 // Top: three cards with the batch's agent count, tokens used in all, and time from first start to last end.
-// Then Running and Finished sections. Each card: a pixel critter whose hat shows the effort level, the task's
+// Then Live and Finished sections. Each card: a pixel critter whose hat shows the effort level, the task's
 // name, agent type, effort level and model, the agent's to-do progress when it keeps a list, its context share, tokens and
 // time, and a bar. A click on the name shows the brief, the token detail, the agent's Transcript,
 // a box to message it, and a Stop button while it runs.
@@ -1176,7 +1176,7 @@ function runningSection($: EngineInterface, els: ElementTable, b: Board) {
   const live = b.rows.filter(isLive)
   return (
     <Box key="running" flexDirection="column">
-      <Text key="head" color="inactive">{`Running | ${live.length}`}</Text>
+      <Text key="head" color="inactive">{`Live | ${live.length}`}</Text>
       {live.map((r) => agentCard($, els, b, r))}
     </Box>
   )
